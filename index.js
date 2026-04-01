@@ -1,4 +1,10 @@
 require("dotenv").config();
+
+const express = require("express");
+const app = express();
+app.get("/", (req, res) => res.send("Bot is running"));
+app.listen(process.env.PORT || 3000);
+
 const TelegramBot = require("node-telegram-bot-api");
 
 const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true });
@@ -426,4 +432,9 @@ bot.on("message", (msg) => {
     `_Reply to them using:_\n` +
     `/send ${chatId} <https://t.me/+2zrOcoVC_Ru4Y2Y0>`
   );
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`Server running on ${PORT}`);
 });
