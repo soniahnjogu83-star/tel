@@ -159,21 +159,23 @@ bot.onText(/\/send (\d+) ([\S]+)/, (msg, match) => {
 });
 
 // ─── ADMIN: /users ───────────────────────────────────────────────────────────
-bot.onText(/\/users/, (msg) => {
-  if (!ADMIN_IDS.includes(String(msg.chat.id))) return;
-  const entries = Object.entries(userSelections);
-  if (entries.length === 0) {
-    return bot.sendMessage(msg.chat.id, "📭 No active users yet.");
+bot.onText(/\/send (\d+) ([\S]+)/, (msg, match) => {
+  if (!ADMIN_IDS.includes(String(msg.chat.id))) {
+    return bot.sendMessage(msg.chat.id, "You are not authorized to use this command.");
   }
-  let report = `📊 *Active Users (${entries.length})*\n\n`;
-  entries.forEach(([chatId, sel]) => {
-    report +=
-      `👤 ID: \`${chatId}\`\n` +
-      `📦 ${sel.package || "—"}\n` +
-      `⏱  ${sel.plan || "—"} | 💰 Ksh ${sel.price || "—"}\n` +
-      `📱 ${sel.phone || "no phone"}\n\n`;
+  const targetChatId = match[1];
+  const accessLink   = match[2];
+  bot.sendMessage(
+    targetChatId,
+    "🎉 Access Granted!\n\n" +
+    "Your payment has been verified. Here is your exclusive link:\n\n" +
+    accessLink + "\n\n" +
+    "Welcome to the family. Don't share this link. 🔐"
+  ).then(() => {
+    bot.sendMessage(msg.chat.id, "✅ Access link sent to user " + targetChatId);
+  }).catch((err) => {
+    bot.sendMessage(msg.chat.id, "❌ Failed: " + err.message);
   });
-  bot.sendMessage(msg.chat.id, report, { parse_mode: "Markdown" });
 });
 
 // ─── CALLBACK QUERIES ────────────────────────────────────────────────────────
