@@ -430,7 +430,7 @@ bot.on("message", (msg) => {
     `💰 Amount: Ksh ${sel.price || "—"}\n\n` +
     `📩 Message:\n${text}\n\n` +
     `_Reply to them using:_\n` +
-    `/send ${chatId} <https://t.me/+2zrOcoVC_Ru4Y2Y0>`
+    `/send ${chatId} <your_channel_link>`
   );
 });
 
