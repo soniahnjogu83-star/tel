@@ -868,7 +868,7 @@ bot.on("callback_query", async (query) => {
 
     return bot.sendMessage(chatId,
       `✅ *${sel.package}* — *${plan.label}* selected\n` +
-      `💰 Ksh *${plan.price}* or $*${usdtPrice} USDT*\n\n` +
+      `💰 Ksh *${plan.price}*\n\n` +
       `How would you like to pay?`,
       {
         parse_mode: "Markdown",
@@ -876,7 +876,7 @@ bot.on("callback_query", async (query) => {
           inline_keyboard: [
             [{ text: `📲 Pay via STK Push (Auto)`,         callback_data: "pay_stk" }],
             [{ text: `💳 Pay Manually via Till`,            callback_data: "show_till" }],
-            [{ text: `💵 Pay with USDT (TRC20)`,            callback_data: "pay_usdt" }],
+            [{ text: `₿ Use Crypto Instead`,               callback_data: "pay_usdt" }],
             [{ text: `⬅️ Change Plan`,                      callback_data: `back_to_${backTarget}` }]
           ]
         }
@@ -908,10 +908,23 @@ bot.on("callback_query", async (query) => {
     sel.usdtAmount = usdtAmount;
     userSelections[chatId] = sel;
 
+    // Show crypto features overview first
     await bot.sendMessage(chatId,
-      `💵 *Pay with USDT (TRC20)*\n\n` +
+      `₿ *Pay with Crypto*\n\n` +
+      `🌍 *Why pay with crypto?*\n` +
+      `• ✅ *100% Anonymous* — no name, no bank, no trace\n` +
+      `• ⚡ *Instant* — auto-detected, access granted automatically\n` +
+      `• 🔒 *Secure* — blockchain-verified, no chargebacks\n` +
+      `• 🌐 *Global* — works from anywhere in the world\n` +
+      `• 💸 *No middleman* — direct wallet-to-wallet\n\n` +
+      `💎 *Accepted:* USDT (TRC20 / Tron Network)\n\n` +
       `📦 *${sel.package}* — *${sel.plan}*\n` +
-      `💰 Amount: *$${usdtAmount} USDT*\n\n` +
+      `💰 Amount: *$${usdtAmount} USDT*`,
+      { parse_mode: "Markdown" }
+    );
+
+    await bot.sendMessage(chatId,
+      `📤 *Send Payment*\n\n` +
       `Send *exactly $${usdtAmount} USDT* to this TRC20 address:\n\n` +
       `\`${USDT_WALLET}\`\n\n` +
       `⚠️ *Important:*\n` +
