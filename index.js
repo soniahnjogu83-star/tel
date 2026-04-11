@@ -345,14 +345,16 @@ async function getMpesaToken() {
 // ─── M-PESA: STK PUSH ─────────────────────────────────────────────────────────
 async function stkPush(phone, amount, chatId) {
   try {
-    const token     = await getMpesaToken();
+    const token = await getMpesaToken();
     const timestamp = moment().format("YYYYMMDDHHmmss");
-    const password  = Buffer.from(`${SHORTCODE}${PASSKEY}${timestamp}`).toString("base64");
+    const password = Buffer.from(`${SHORTCODE}${PASSKEY}${timestamp}`).toString("base64");
 
     let normalized = phone.trim();
     normalized = normalized.replace(/^\+/, "");
     normalized = normalized.replace(/^0/, "254");
+
     console.log("📱 Normalized phone:", normalized);
+    console.log("🏢 Business Shortcode:", SHORTCODE);
 
     if (!/^2547\d{8}$|^2541\d{8}$/.test(normalized)) {
       throw new Error(`Invalid phone format: ${normalized}`);
@@ -360,16 +362,16 @@ async function stkPush(phone, amount, chatId) {
 
     const payload = {
       BusinessShortCode: SHORTCODE,
-      Password:          password,
-      Timestamp:         timestamp,
-      TransactionType:   "CustomerBuyGoodsOnline",
-      Amount:            Math.ceil(amount),
-      PartyA:            normalized,
-      PartyB:            TILL_NUMBER,
-      PhoneNumber:       normalized,
-      CallBackURL:       CALLBACK_URL,
-      AccountReference:  "ALJAKI",
-      TransactionDesc:   "Content Access"
+      Password: password,
+      Timestamp: timestamp,
+      TransactionType: "CustomerBuyGoodsOnline",
+      Amount: Math.ceil(Number(amount)),
+      PartyA: normalized,
+      PartyB: SHORTCODE,
+      PhoneNumber: normalized,
+      CallBackURL: CALLBACK_URL,
+      AccountReference: "ALJAKI",
+      TransactionDesc: "Content Access"
     };
 
     console.log("📤 STK Payload:", JSON.stringify(payload, null, 2));
@@ -377,7 +379,12 @@ async function stkPush(phone, amount, chatId) {
     const res = await axios.post(
       "https://api.safaricom.co.ke/mpesa/stkpush/v1/processrequest",
       payload,
-      { headers: { Authorization: `Bearer ${token}` } }
+      {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json"
+        }
+      }
     );
 
     console.log("✅ STK Response:", res.data);
@@ -385,7 +392,6 @@ async function stkPush(phone, amount, chatId) {
     if (res.data.ResponseCode === "0") {
       pendingSTK[res.data.CheckoutRequestID] = chatId;
     } else {
-      // STK accepted but Safaricom returned non-zero code — notify admins
       notifyAdmins(
         `⚠️ *STK Push Non-Zero Response*\n\n` +
         `Chat ID: \`${chatId}\`\n` +
@@ -397,8 +403,8 @@ async function stkPush(phone, amount, chatId) {
 
     return res.data;
   } catch (err) {
-    console.error("❌ STK Push error:", err.response?.data || err.message);
-    // Notify admins of STK push failures with full detail
+    console.error("❌ FULL STK ERROR:", JSON.stringify(err.response?.data, null, 2) || err.message);
+
     notifyAdmins(
       `🚨 *STK Push Failed*\n\n` +
       `Chat ID: \`${chatId}\`\n` +
@@ -406,10 +412,10 @@ async function stkPush(phone, amount, chatId) {
       `Amount: \`${amount}\`\n\n` +
       `Error: \`${JSON.stringify(err.response?.data || err.message)}\``
     );
+
     throw err;
   }
 }
-
 // ─── M-PESA CALLBACK ──────────────────────────────────────────────────────────
 app.post("/mpesa/callback", (req, res) => {
   res.status(200).json({ ResultCode: 0, ResultDesc: "Accepted" });
