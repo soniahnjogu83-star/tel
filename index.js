@@ -20,12 +20,11 @@ const PASSKEY       = process.env.PASSKEY;
 const CONSUMER_KEY  = process.env.CONSUMER_KEY;
 const CONSUMER_SECRET = process.env.CONSUMER_SECRET;
 const CALLBACK_URL  = process.env.CALLBACK_URL;
-const ACCESS_LINK   = process.env.ACCESS_LINK || ""; // channel/group link auto-sent on payment
+const ACCESS_LINK   = process.env.ACCESS_LINK || "";
 
 // ─── CHANNEL CONFIG ──────────────────────────────────────────────────────────
-const CHANNEL_ID = "-1001567081082"; // private channel bot is admin of
+const CHANNEL_ID = "-1001567081082";
 
-// Plan label → duration in days
 const PLAN_DAYS = {
   "1 Day":    1,
   "1 Week":   7,
@@ -35,16 +34,13 @@ const PLAN_DAYS = {
   "1 Year":   365,
 };
 
-// active subscriptions: subTimers[chatId] = { warnTimer, kickTimer, expiresAt }
 const subTimers = {};
 
-// Generate a 1-use invite link, send it to user, schedule warning + kick
 async function grantAccess(chatId, planLabel, paymentSummary) {
   try {
     const days        = PLAN_DAYS[planLabel] || 30;
     const expireDate  = Math.floor(Date.now() / 1000) + days * 86400;
 
-    // Create single-use invite link
     const inviteRes = await bot.createChatInviteLink(CHANNEL_ID, {
       member_limit:  1,
       expire_date:   expireDate,
@@ -52,7 +48,6 @@ async function grantAccess(chatId, planLabel, paymentSummary) {
     });
     const inviteLink = inviteRes.invite_link;
 
-    // Send access to user
     await bot.sendMessage(chatId,
       `🎉 *Access Granted!*\n\n` +
       `${paymentSummary}\n\n` +
@@ -63,7 +58,6 @@ async function grantAccess(chatId, planLabel, paymentSummary) {
       { parse_mode: "Markdown" }
     );
 
-    // Schedule 24hr warning (only if plan > 1 day)
     clearSubTimers(chatId);
     const timers = {};
     timers.expiresAt = Date.now() + days * 86400 * 1000;
@@ -86,11 +80,9 @@ async function grantAccess(chatId, planLabel, paymentSummary) {
       }, (days - 1) * 86400 * 1000);
     }
 
-    // Schedule kick when plan expires
     timers.kickTimer = setTimeout(async () => {
       try {
         await bot.banChatMember(CHANNEL_ID, chatId);
-        // Unban immediately so they can rejoin if they pay again
         await bot.unbanChatMember(CHANNEL_ID, chatId);
       } catch (e) {
         console.error("Kick error:", e.message);
@@ -115,7 +107,6 @@ async function grantAccess(chatId, planLabel, paymentSummary) {
     console.log(`✅ Access granted to ${chatId} | ${planLabel} | expires in ${days}d`);
   } catch (err) {
     console.error("grantAccess error:", err.message);
-    // Fallback: notify admins to send manually
     notifyAdmins(
       `⚠️ *Auto-invite failed for* \`${chatId}\`\n` +
       `Error: ${err.message}\n\n` +
@@ -135,26 +126,18 @@ function clearSubTimers(chatId) {
 // ─── USDT CONFIG ─────────────────────────────────────────────────────────────
 const USDT_WALLET   = "TH25gdz6zpuaxYjWMemKYt8eRjvYVfTFrp";
 const USDT_NETWORK  = "TRC20 (Tron)";
-// pendingUSDT[chatId] = { usdtAmount, intervalId, expiresAt }
 const pendingUSDT   = {};
 
-// Convert KES price to USDT: divide by 10
 function toUsdt(kshPrice) {
   return parseFloat((kshPrice / 10).toFixed(2));
 }
 
 // ─── STORE ───────────────────────────────────────────────────────────────────
-// userSelections[chatId] = { package, plan, price, phone, paidAt, stkRef }
 const userSelections = {};
-
-// pendingSTK[CheckoutRequestID] = chatId
 const pendingSTK = {};
-
-// reminderTimers[chatId] = { timers: [...] }  — so we can clear them on purchase
 const reminderTimers = {};
 
 // ─── PAYMENT LEDGER ──────────────────────────────────────────────────────────
-// paymentLedger[] = { chatId, username, package, plan, amount, ref, phone, paidAt }
 const paymentLedger = [];
 
 function recordPayment({ chatId, username, pkg, plan, amount, ref, phone, currency = "KES" }) {
@@ -241,17 +224,17 @@ function clearReminders(chatId) {
   }
 }
 
-// ─── SMART REMINDERS (non-pushy, creative) ───────────────────────────────────
+// ─── SMART REMINDERS ─────────────────────────────────────────────────────────
 function scheduleReminders(chatId) {
   clearReminders(chatId);
 
-  const sel = userSelections[chatId] || {};
-  const pkg = sel.package || "the package";
+  const sel   = userSelections[chatId] || {};
+  const pkg   = sel.package || "the package";
   const price = sel.price || "";
 
   const messages = [
     {
-      delay: 10 * 60 * 1000, // 10 min
+      delay: 10 * 60 * 1000,
       text:
         `👋 Hey, just checking in — did you run into any trouble during checkout?\n\n` +
         `Sometimes M-Pesa gets a little moody. If anything went sideways, I'm here to sort it out. 🛠️\n\n` +
@@ -263,7 +246,7 @@ function scheduleReminders(chatId) {
       ]
     },
     {
-      delay: 30 * 60 * 1000, // 30 min
+      delay: 30 * 60 * 1000,
       text:
         `🔍 Noticed your session is still open — no pressure at all, just wanted to make sure everything's good on your end.\n\n` +
         `Your selected plan${price ? ` (*Ksh ${price}*)` : ""} is waiting whenever you're ready. Take your time. ⏳`,
@@ -274,7 +257,7 @@ function scheduleReminders(chatId) {
       ]
     },
     {
-      delay: 2 * 60 * 60 * 1000, // 2 hrs
+      delay: 2 * 60 * 60 * 1000,
       text:
         `💡 Quick thought — a lot of people who hesitated at first said it was *100% worth it* after they joined.\n\n` +
         `If there's anything holding you back (price, payment, anything), just say the word and we'll figure it out together. 🤝`,
@@ -288,10 +271,8 @@ function scheduleReminders(chatId) {
 
   const timers = messages.map(({ delay, text, keyboard }) =>
     setTimeout(() => {
-      // Don't remind if they've already paid
       const current = userSelections[chatId];
       if (current && current.paidAt) return;
-
       bot.sendMessage(chatId, text, {
         parse_mode: "Markdown",
         reply_markup: { inline_keyboard: keyboard }
@@ -302,23 +283,22 @@ function scheduleReminders(chatId) {
   reminderTimers[chatId] = { timers };
 }
 
-// ─── M-PESA: GET ACCESS TOKEN ─────────────────────────────────────────────────
+// ─── M-PESA: GET ACCESS TOKEN (PRODUCTION) ───────────────────────────────────
 async function getMpesaToken() {
   const auth = Buffer.from(`${CONSUMER_KEY}:${CONSUMER_SECRET}`).toString("base64");
   const res = await axios.get(
-    "https://sandbox.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials",
+    "https://api.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials", // ✅ PRODUCTION
     { headers: { Authorization: `Basic ${auth}` } }
   );
   return res.data.access_token;
 }
 
-// ─── M-PESA: STK PUSH ─────────────────────────────────────────────────────────
+// ─── M-PESA: STK PUSH (PRODUCTION) ───────────────────────────────────────────
 async function stkPush(phone, amount, chatId) {
   const token     = await getMpesaToken();
   const timestamp = moment().format("YYYYMMDDHHmmss");
   const password  = Buffer.from(`${SHORTCODE}${PASSKEY}${timestamp}`).toString("base64");
 
-  // Normalize phone: 07... → 2547...
   const normalized = phone.replace(/^0/, "254").replace(/^\+/, "");
 
   const payload = {
@@ -336,13 +316,14 @@ async function stkPush(phone, amount, chatId) {
   };
 
   const res = await axios.post(
-    "https://sandbox.safaricom.co.ke/mpesa/stkpush/v1/processrequest",
+    "https://api.safaricom.co.ke/mpesa/stkpush/v1/processrequest", // ✅ PRODUCTION
     payload,
     { headers: { Authorization: `Bearer ${token}` } }
   );
 
   if (res.data.ResponseCode === "0") {
     pendingSTK[res.data.CheckoutRequestID] = chatId;
+    console.log(`📲 STK Push sent | CheckoutID: ${res.data.CheckoutRequestID} | chatId: ${chatId}`);
   }
 
   return res.data;
@@ -352,22 +333,26 @@ async function stkPush(phone, amount, chatId) {
 app.post("/mpesa/callback", (req, res) => {
   res.status(200).json({ ResultCode: 0, ResultDesc: "Accepted" });
 
+  console.log("📩 M-Pesa callback received:", JSON.stringify(req.body, null, 2));
+
   try {
     const body     = req.body?.Body?.stkCallback;
     const checkId  = body?.CheckoutRequestID;
     const code     = body?.ResultCode;
     const chatId   = pendingSTK[checkId];
 
-    if (!chatId) return;
+    if (!chatId) {
+      console.warn(`⚠️ No chatId found for CheckoutRequestID: ${checkId}`);
+      return;
+    }
     delete pendingSTK[checkId];
 
     if (code === 0) {
-      // Payment success
-      const meta    = body.CallbackMetadata?.Item || [];
-      const get     = (name) => meta.find((i) => i.Name === name)?.Value ?? "—";
-      const amount  = get("Amount");
+      const meta      = body.CallbackMetadata?.Item || [];
+      const get       = (name) => meta.find((i) => i.Name === name)?.Value ?? "—";
+      const amount    = get("Amount");
       const mpesaCode = get("MpesaReceiptNumber");
-      const phone   = get("PhoneNumber");
+      const phone     = get("PhoneNumber");
 
       const sel = userSelections[chatId] || {};
       sel.paidAt  = new Date().toISOString();
@@ -377,7 +362,6 @@ app.post("/mpesa/callback", (req, res) => {
 
       clearReminders(chatId);
 
-      // Record in ledger
       recordPayment({
         chatId,
         username: sel.username || String(chatId),
@@ -388,7 +372,6 @@ app.post("/mpesa/callback", (req, res) => {
         phone
       });
 
-      // Auto-grant access via unique invite link
       const summary = `✅ Ksh *${amount}* received via M-Pesa\n🧾 Ref: \`${mpesaCode}\``;
       grantAccess(chatId, sel.plan || "1 Month", summary);
 
@@ -403,7 +386,7 @@ app.post("/mpesa/callback", (req, res) => {
         `➡️ Send access with:\n\`/send ${chatId} <link>\``
       );
     } else {
-      // Payment failed/cancelled
+      console.log(`❌ STK failed | ResultCode: ${code} | chatId: ${chatId}`);
       bot.sendMessage(chatId,
         `⚠️ *Payment wasn't completed.*\n\n` +
         `No worries — it happens! You can try again below or use the manual M-Pesa option.\n\n` +
@@ -424,17 +407,15 @@ app.post("/mpesa/callback", (req, res) => {
   }
 });
 
-// ─── USDT: POLL TRONGRID FOR INCOMING PAYMENT ───────────────────────────────
+// ─── USDT: POLL TRONGRID ──────────────────────────────────────────────────────
 async function startUsdtPoller(chatId, expectedUsdt) {
-  // Stop any existing poller for this user
   stopUsdtPoller(chatId);
 
-  const expiresAt = Date.now() + 30 * 60 * 1000; // 30 min window
-  const startTime = Math.floor(Date.now() / 1000) - 60; // look back 1 min
+  const expiresAt = Date.now() + 30 * 60 * 1000;
+  const startTime = Math.floor(Date.now() / 1000) - 60;
 
   const intervalId = setInterval(async () => {
     try {
-      // Expired — stop polling
       if (Date.now() > expiresAt) {
         stopUsdtPoller(chatId);
         bot.sendMessage(chatId,
@@ -443,8 +424,8 @@ async function startUsdtPoller(chatId, expectedUsdt) {
             parse_mode: "Markdown",
             reply_markup: {
               inline_keyboard: [
-                [{ text: "🔄 Try USDT Again",        callback_data: "pay_usdt" }],
-                [{ text: "📲 Switch to M-Pesa",      callback_data: "pay_stk" }]
+                [{ text: "🔄 Try USDT Again",   callback_data: "pay_usdt" }],
+                [{ text: "📲 Switch to M-Pesa", callback_data: "pay_stk" }]
               ]
             }
           }
@@ -452,8 +433,7 @@ async function startUsdtPoller(chatId, expectedUsdt) {
         return;
       }
 
-      // Query TronGrid for TRC20 USDT transfers to our wallet
-      const USDT_CONTRACT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"; // mainnet USDT TRC20
+      const USDT_CONTRACT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t";
       const url = `https://api.trongrid.io/v1/accounts/${USDT_WALLET}/transactions/trc20` +
         `?contract_address=${USDT_CONTRACT}&limit=20&min_timestamp=${startTime * 1000}`;
 
@@ -464,9 +444,8 @@ async function startUsdtPoller(chatId, expectedUsdt) {
       const txns = res.data?.data || [];
       for (const tx of txns) {
         if (tx.to?.toLowerCase() !== USDT_WALLET.toLowerCase()) continue;
-        const received = parseFloat(tx.value) / 1_000_000; // USDT has 6 decimals
+        const received = parseFloat(tx.value) / 1_000_000;
         if (received >= expectedUsdt) {
-          // ✅ Payment found!
           stopUsdtPoller(chatId);
           clearReminders(chatId);
 
@@ -486,7 +465,6 @@ async function startUsdtPoller(chatId, expectedUsdt) {
             currency: "USDT"
           });
 
-          // Auto-grant access via unique invite link
           const usdtSummary = `✅ *$${received} USDT* received\n🧾 TxID: \`${tx.transaction_id.substring(0, 20)}...\``;
           grantAccess(chatId, sel.plan || "1 Month", usdtSummary);
 
@@ -505,7 +483,7 @@ async function startUsdtPoller(chatId, expectedUsdt) {
     } catch (err) {
       console.error("USDT poller error:", err.message);
     }
-  }, 15000); // poll every 15 seconds
+  }, 15000);
 
   pendingUSDT[chatId] = { usdtAmount: expectedUsdt, intervalId, expiresAt };
 }
@@ -528,8 +506,8 @@ bot.onText(/\/start/, (msg) => {
     {
       reply_markup: {
         inline_keyboard: [
-          [{ text: "🔥 Naughty Premium Leaks",           callback_data: "package_naughty_premium_leaks" }],
-          [{ text: "💥 Naughty Explicit (Free Hookups)",  callback_data: "package_naughty_explicit" }]
+          [{ text: "🔥 Naughty Premium Leaks",          callback_data: "package_naughty_premium_leaks" }],
+          [{ text: "💥 Naughty Explicit (Free Hookups)", callback_data: "package_naughty_explicit" }]
         ]
       }
     }
@@ -597,7 +575,6 @@ bot.onText(/\/send (\d+) ([\S]+)/, (msg, match) => {
     { parse_mode: "Markdown" }
   ).then(() => {
     bot.sendMessage(msg.chat.id, `✅ Access link sent to \`${targetChatId}\``, { parse_mode: "Markdown" });
-    // Schedule kick based on plan if known
     if (sel.plan) {
       const days = PLAN_DAYS[sel.plan] || 30;
       clearSubTimers(targetChatId);
@@ -626,7 +603,7 @@ bot.onText(/\/send (\d+) ([\S]+)/, (msg, match) => {
   });
 });
 
-// ─── ADMIN: /users — list active sessions ─────────────────────────────────────
+// ─── ADMIN: /users ────────────────────────────────────────────────────────────
 bot.onText(/\/users/, (msg) => {
   if (!ADMIN_IDS.includes(String(msg.chat.id))) {
     return bot.sendMessage(msg.chat.id, "⛔ Not authorized.");
@@ -644,7 +621,7 @@ bot.onText(/\/users/, (msg) => {
   );
 });
 
-// ─── ADMIN: /broadcast <message> ──────────────────────────────────────────────
+// ─── ADMIN: /broadcast ────────────────────────────────────────────────────────
 bot.onText(/\/broadcast (.+)/, (msg, match) => {
   if (!ADMIN_IDS.includes(String(msg.chat.id))) {
     return bot.sendMessage(msg.chat.id, "⛔ Not authorized.");
@@ -654,11 +631,8 @@ bot.onText(/\/broadcast (.+)/, (msg, match) => {
   if (!targets.length) {
     return bot.sendMessage(msg.chat.id, "📭 No users to broadcast to.");
   }
-  let sent = 0;
   targets.forEach((id) => {
-    bot.sendMessage(id, `📢 *Announcement*\n\n${text}`, { parse_mode: "Markdown" })
-      .then(() => sent++)
-      .catch(() => {});
+    bot.sendMessage(id, `📢 *Announcement*\n\n${text}`, { parse_mode: "Markdown" }).catch(() => {});
   });
   bot.sendMessage(msg.chat.id, `📣 Broadcast sent to *${targets.length}* user(s).`, { parse_mode: "Markdown" });
 });
@@ -668,14 +642,10 @@ bot.onText(/\/stats/, (msg) => {
   if (!ADMIN_IDS.includes(String(msg.chat.id))) {
     return bot.sendMessage(msg.chat.id, "⛔ Not authorized.");
   }
-  const all   = Object.values(userSelections);
-  const paid  = all.filter((s) => s.paidAt).length;
-  const unpaid = all.length - paid;
-
-  const revenue = all
-    .filter((s) => s.paidAt && s.price)
-    .reduce((sum, s) => sum + Number(s.price), 0);
-
+  const all        = Object.values(userSelections);
+  const paid       = all.filter((s) => s.paidAt).length;
+  const unpaid     = all.length - paid;
+  const revenue    = all.filter((s) => s.paidAt && s.price).reduce((sum, s) => sum + Number(s.price), 0);
   const usdtPending = Object.keys(pendingUSDT).length;
 
   bot.sendMessage(msg.chat.id,
@@ -689,14 +659,12 @@ bot.onText(/\/stats/, (msg) => {
   );
 });
 
-// ─── ADMIN: /balance ────────────────────────────────────────────────────────
+// ─── ADMIN: /balance ──────────────────────────────────────────────────────────
 bot.onText(/\/balance/, (msg) => {
   if (!ADMIN_IDS.includes(String(msg.chat.id))) {
     return bot.sendMessage(msg.chat.id, "⛔ Not authorized.");
   }
   const s = getLedgerStats();
-
-  // Last 5 transactions
   const recent = paymentLedger.slice(-5).reverse();
   const recentLines = recent.length
     ? recent.map((p, i) => {
@@ -721,7 +689,7 @@ bot.onText(/\/balance/, (msg) => {
   );
 });
 
-// ─── ADMIN: /ledger — full transaction history ────────────────────────────────
+// ─── ADMIN: /ledger ───────────────────────────────────────────────────────────
 bot.onText(/\/ledger/, (msg) => {
   if (!ADMIN_IDS.includes(String(msg.chat.id))) {
     return bot.sendMessage(msg.chat.id, "⛔ Not authorized.");
@@ -733,24 +701,20 @@ bot.onText(/\/ledger/, (msg) => {
     const amt = p.currency === "USDT" ? `$${p.amount} USDT` : `Ksh ${p.amount}`;
     return `${i + 1}. *${amt}* | ${p.package || "—"} ${p.plan || ""} | 🆔 \`${p.chatId}\` | 🧾 \`${p.ref}\` | ${p.paidAt}`;
   });
-  // Telegram message limit — split if too long
   const chunks = [];
   let chunk = `📋 *Full Payment Ledger (${paymentLedger.length} total)*\n\n`;
   for (const line of lines) {
-    if ((chunk + line).length > 3800) {
-      chunks.push(chunk);
-      chunk = "";
-    }
+    if ((chunk + line).length > 3800) { chunks.push(chunk); chunk = ""; }
     chunk += line + "\n";
   }
   chunks.push(chunk);
   chunks.forEach((c) => bot.sendMessage(msg.chat.id, c, { parse_mode: "Markdown" }).catch(() => {}));
 });
 
-// ─── ADMIN: /kick <chatId> — manually remove a user early ──────────────────────
+// ─── ADMIN: /kick <chatId> ────────────────────────────────────────────────────
 bot.onText(/\/kick (\d+)/, async (msg, match) => {
   if (!ADMIN_IDS.includes(String(msg.chat.id))) {
-    return bot.sendMessage(msg.chat.id, '⛔ Not authorized.');
+    return bot.sendMessage(msg.chat.id, "⛔ Not authorized.");
   }
   const targetId = match[1];
   try {
@@ -759,30 +723,29 @@ bot.onText(/\/kick (\d+)/, async (msg, match) => {
     clearSubTimers(targetId);
     bot.sendMessage(targetId,
       `👋 *Your access has been removed.*\n\nYour plan has ended. We hope you enjoyed your time with us! 🙏\n\nReady to come back? Tap below 😊`,
-      { parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[{ text: '🔄 Re-subscribe', callback_data: 'change_package' }]] } }
+      { parse_mode: "Markdown", reply_markup: { inline_keyboard: [[{ text: "🔄 Re-subscribe", callback_data: "change_package" }]] } }
     ).catch(() => {});
-    bot.sendMessage(msg.chat.id, `✅ User \`${targetId}\` removed from channel.`, { parse_mode: 'Markdown' });
+    bot.sendMessage(msg.chat.id, `✅ User \`${targetId}\` removed from channel.`, { parse_mode: "Markdown" });
   } catch (err) {
     bot.sendMessage(msg.chat.id, `❌ Failed: ${err.message}`);
   }
 });
 
-// ─── ADMIN: /subs — list active subscriptions ────────────────────────────────
+// ─── ADMIN: /subs ─────────────────────────────────────────────────────────────
 bot.onText(/\/subs/, (msg) => {
   if (!ADMIN_IDS.includes(String(msg.chat.id))) {
-    return bot.sendMessage(msg.chat.id, '⛔ Not authorized.');
+    return bot.sendMessage(msg.chat.id, "⛔ Not authorized.");
   }
   const entries = Object.entries(subTimers);
-  if (!entries.length) return bot.sendMessage(msg.chat.id, '📭 No active subscriptions.');
+  if (!entries.length) return bot.sendMessage(msg.chat.id, "📭 No active subscriptions.");
   const lines = entries.map(([id, t]) => {
     const sel = userSelections[id] || {};
-    const exp = t.expiresAt ? moment(t.expiresAt).format('DD MMM YYYY, HH:mm') : 'unknown';
-    return `• \`${id}\` — ${sel.plan || '?'} | expires ${exp}`;
+    const exp = t.expiresAt ? moment(t.expiresAt).format("DD MMM YYYY, HH:mm") : "unknown";
+    return `• \`${id}\` — ${sel.plan || "?"} | expires ${exp}`;
   });
   bot.sendMessage(msg.chat.id,
-    `🔐 *Active Subscriptions (${entries.length})*\n\n${lines.join('\n')}\n\n` +
-    `_To remove early: /kick <chatId>_`,
-    { parse_mode: 'Markdown' }
+    `🔐 *Active Subscriptions (${entries.length})*\n\n${lines.join("\n")}\n\n_To remove early: /kick <chatId>_`,
+    { parse_mode: "Markdown" }
   );
 });
 
@@ -793,14 +756,9 @@ bot.onText(/\/reply (\d+) (.+)/, (msg, match) => {
   }
   const targetId = match[1];
   const text     = match[2];
-  bot.sendMessage(targetId,
-    `💬 *Message from Support*\n\n${text}`,
-    { parse_mode: "Markdown" }
-  ).then(() => {
-    bot.sendMessage(msg.chat.id, `✅ Reply sent to \`${targetId}\``, { parse_mode: "Markdown" });
-  }).catch((err) => {
-    bot.sendMessage(msg.chat.id, `❌ Failed: ${err.message}`);
-  });
+  bot.sendMessage(targetId, `💬 *Message from Support*\n\n${text}`, { parse_mode: "Markdown" })
+    .then(() => bot.sendMessage(msg.chat.id, `✅ Reply sent to \`${targetId}\``, { parse_mode: "Markdown" }))
+    .catch((err) => bot.sendMessage(msg.chat.id, `❌ Failed: ${err.message}`));
 });
 
 // ─── CALLBACK QUERIES ─────────────────────────────────────────────────────────
@@ -810,7 +768,6 @@ bot.on("callback_query", async (query) => {
 
   bot.answerCallbackQuery(query.id).catch(() => {});
 
-  // ── Package selection ──
   if (data === "package_naughty_premium_leaks") {
     userSelections[chatId] = { package: "Naughty Premium Leaks" };
     return bot.sendMessage(chatId,
@@ -819,12 +776,12 @@ bot.on("callback_query", async (query) => {
         parse_mode: "Markdown",
         reply_markup: {
           inline_keyboard: [
-            [{ text: "1 Day — Ksh 30",                      callback_data: "naughty_1day" }],
-            [{ text: "1 Week — Ksh 150",                    callback_data: "naughty_1week" }],
-            [{ text: "2 Weeks — Ksh 250",                   callback_data: "naughty_2weeks" }],
-            [{ text: "1 Month — Ksh 450",                   callback_data: "naughty_1month" }],
-            [{ text: "6 Months — Ksh 2,500 🔥 Best Value",  callback_data: "naughty_6months" }],
-            [{ text: "1 Year — Ksh 5,000 👑 VIP",           callback_data: "naughty_1year" }]
+            [{ text: "1 Day — Ksh 30",                     callback_data: "naughty_1day" }],
+            [{ text: "1 Week — Ksh 150",                   callback_data: "naughty_1week" }],
+            [{ text: "2 Weeks — Ksh 250",                  callback_data: "naughty_2weeks" }],
+            [{ text: "1 Month — Ksh 450",                  callback_data: "naughty_1month" }],
+            [{ text: "6 Months — Ksh 2,500 🔥 Best Value", callback_data: "naughty_6months" }],
+            [{ text: "1 Year — Ksh 5,000 👑 VIP",          callback_data: "naughty_1year" }]
           ]
         }
       }
@@ -839,19 +796,18 @@ bot.on("callback_query", async (query) => {
         parse_mode: "Markdown",
         reply_markup: {
           inline_keyboard: [
-            [{ text: "1 Day — Ksh 42",                      callback_data: "premium_1day" }],
-            [{ text: "1 Week — Ksh 200",                    callback_data: "premium_1week" }],
-            [{ text: "2 Weeks — Ksh 400",                   callback_data: "premium_2weeks" }],
-            [{ text: "1 Month — Ksh 650",                   callback_data: "premium_1month" }],
-            [{ text: "6 Months — Ksh 3,000 🔥 Best Value",  callback_data: "premium_6months" }],
-            [{ text: "1 Year — Ksh 6,000 👑 VIP",           callback_data: "premium_1year" }]
+            [{ text: "1 Day — Ksh 42",                     callback_data: "premium_1day" }],
+            [{ text: "1 Week — Ksh 200",                   callback_data: "premium_1week" }],
+            [{ text: "2 Weeks — Ksh 400",                  callback_data: "premium_2weeks" }],
+            [{ text: "1 Month — Ksh 650",                  callback_data: "premium_1month" }],
+            [{ text: "6 Months — Ksh 3,000 🔥 Best Value", callback_data: "premium_6months" }],
+            [{ text: "1 Year — Ksh 6,000 👑 VIP",          callback_data: "premium_1year" }]
           ]
         }
       }
     );
   }
 
-  // ── Plan selection ──
   if (PLANS[data]) {
     const plan = PLANS[data];
     const sel  = userSelections[chatId] || {};
@@ -860,10 +816,7 @@ bot.on("callback_query", async (query) => {
     userSelections[chatId] = sel;
 
     const backTarget = data.startsWith("naughty_") ? "package_naughty_premium_leaks" : "package_naughty_explicit";
-
-    // Schedule reminders from the moment they pick a plan
     scheduleReminders(chatId);
-
     const usdtPrice = toUsdt(plan.price);
 
     return bot.sendMessage(chatId,
@@ -874,22 +827,19 @@ bot.on("callback_query", async (query) => {
         parse_mode: "Markdown",
         reply_markup: {
           inline_keyboard: [
-            [{ text: `📲 Pay via STK Push (Auto)`,         callback_data: "pay_stk" }],
-            [{ text: `💳 Pay Manually via Till`,            callback_data: "show_till" }],
-            [{ text: `₿ Use Crypto Instead`,               callback_data: "pay_usdt" }],
-            [{ text: `⬅️ Change Plan`,                      callback_data: `back_to_${backTarget}` }]
+            [{ text: `📲 Pay via STK Push (Auto)`,  callback_data: "pay_stk" }],
+            [{ text: `💳 Pay Manually via Till`,     callback_data: "show_till" }],
+            [{ text: `₿ Use Crypto Instead`,        callback_data: "pay_usdt" }],
+            [{ text: `⬅️ Change Plan`,               callback_data: `back_to_${backTarget}` }]
           ]
         }
       }
     );
   }
 
-  // ── STK Push: ask for phone ──
   if (data === "pay_stk") {
     const sel = userSelections[chatId];
-    if (!sel || !sel.price) {
-      return bot.sendMessage(chatId, "⚠️ Please start over with /start.");
-    }
+    if (!sel || !sel.price) return bot.sendMessage(chatId, "⚠️ Please start over with /start.");
     userSelections[chatId].awaitingPhone = true;
     return bot.sendMessage(chatId,
       `📱 *Enter your M-Pesa phone number* and we'll send you a payment prompt directly.\n\n` +
@@ -898,17 +848,13 @@ bot.on("callback_query", async (query) => {
     );
   }
 
-  // ── USDT Payment ──
   if (data === "pay_usdt") {
     const sel = userSelections[chatId];
-    if (!sel || !sel.price) {
-      return bot.sendMessage(chatId, "⚠️ Please start over with /start.");
-    }
+    if (!sel || !sel.price) return bot.sendMessage(chatId, "⚠️ Please start over with /start.");
     const usdtAmount = toUsdt(sel.price);
     sel.usdtAmount = usdtAmount;
     userSelections[chatId] = sel;
 
-    // Show crypto features overview first
     await bot.sendMessage(chatId,
       `₿ *Pay with Crypto*\n\n` +
       `🌍 *Why pay with crypto?*\n` +
@@ -935,17 +881,13 @@ bot.on("callback_query", async (query) => {
       { parse_mode: "Markdown" }
     );
 
-    // Start polling for this payment
     await startUsdtPoller(chatId, usdtAmount);
     return;
   }
 
-  // ── Show manual till ──
   if (data === "show_till") {
     const sel = userSelections[chatId];
-    if (!sel || !sel.price) {
-      return bot.sendMessage(chatId, "⚠️ Please start over with /start.");
-    }
+    if (!sel || !sel.price) return bot.sendMessage(chatId, "⚠️ Please start over with /start.");
     return bot.sendMessage(chatId,
       `⚡ *Let's get you in!*\n\n` +
       `\`\`\`\n${tillCard(sel.package, sel.plan, sel.price)}\n\`\`\`\n\n` +
@@ -968,24 +910,21 @@ bot.on("callback_query", async (query) => {
     );
   }
 
-  // ── Back navigation ──
   if (data.startsWith("back_to_")) {
     return bot.emit("callback_query", { ...query, data: data.replace("back_to_", "") });
   }
 
-  // ── Change package ──
   if (data === "change_package") {
     return bot.sendMessage(chatId, "Sure! Pick a different package below 👇", {
       reply_markup: {
         inline_keyboard: [
-          [{ text: "🔥 Naughty Premium Leaks",           callback_data: "package_naughty_premium_leaks" }],
-          [{ text: "💥 Naughty Explicit (Free Hookups)",  callback_data: "package_naughty_explicit" }]
+          [{ text: "🔥 Naughty Premium Leaks",          callback_data: "package_naughty_premium_leaks" }],
+          [{ text: "💥 Naughty Explicit (Free Hookups)", callback_data: "package_naughty_explicit" }]
         ]
       }
     });
   }
 
-  // ── Manual payment confirmation ──
   if (data === "confirm_payment") {
     const sel      = userSelections[chatId] || {};
     const username = query.from.username ? `@${query.from.username}` : query.from.first_name;
@@ -1018,7 +957,6 @@ bot.on("callback_query", async (query) => {
     );
   }
 
-  // ── Follow up ──
   if (data === "follow_up") {
     const sel      = userSelections[chatId] || {};
     const username = query.from.username ? `@${query.from.username}` : query.from.first_name;
@@ -1038,7 +976,6 @@ bot.on("callback_query", async (query) => {
     );
   }
 
-  // ── Need help ──
   if (data === "need_help") {
     const sel = userSelections[chatId] || {};
     return bot.sendMessage(chatId,
@@ -1051,21 +988,18 @@ bot.on("callback_query", async (query) => {
         parse_mode: "Markdown",
         reply_markup: {
           inline_keyboard: [
-            [{ text: "🔁 Try Again", callback_data: "show_till" }],
-            [{ text: "📲 Try STK Push Instead", callback_data: "pay_stk" }]
+            [{ text: "🔁 Try Again",             callback_data: "show_till" }],
+            [{ text: "📲 Try STK Push Instead",  callback_data: "pay_stk" }]
           ]
         }
       }
     );
   }
 
-  // ── Dismiss reminder ──
   if (data === "dismiss_reminder") {
     clearReminders(chatId);
     stopUsdtPoller(chatId);
-    return bot.sendMessage(chatId,
-      `No worries at all! 👍 If you ever change your mind, just hit /start — we'll be here.`
-    );
+    return bot.sendMessage(chatId, `No worries at all! 👍 If you ever change your mind, just hit /start — we'll be here.`);
   }
 });
 
@@ -1078,7 +1012,6 @@ bot.on("message", async (msg) => {
 
   const sel = userSelections[chatId] || {};
 
-  // ── Phone number → STK Push ──
   if (/^(\+?254|0)[17]\d{8}$/.test(text.trim())) {
     if (userSelections[chatId]) userSelections[chatId].phone = text.trim();
 
@@ -1100,13 +1033,14 @@ bot.on("message", async (msg) => {
             { parse_mode: "Markdown" }
           );
         } else {
-          throw new Error(result.errorMessage || "STK failed");
+          throw new Error(result.errorMessage || result.ResponseDescription || "STK push failed");
         }
       } catch (err) {
         console.error("STK Push error:", err.message);
         return bot.sendMessage(chatId,
-          `⚠️ Couldn't send the M-Pesa prompt right now.\n\nYou can pay manually instead — tap below 👇`,
+          `⚠️ Couldn't send the M-Pesa prompt right now.\n\nError: _${err.message}_\n\nYou can pay manually instead — tap below 👇`,
           {
+            parse_mode: "Markdown",
             reply_markup: {
               inline_keyboard: [
                 [{ text: "💳 Pay Manually via Till", callback_data: "show_till" }]
@@ -1130,10 +1064,8 @@ bot.on("message", async (msg) => {
     }
   }
 
-  // ── Skip admin messages ──
   if (ADMIN_IDS.includes(String(chatId))) return;
 
-  // ── Forward all other messages to admins ──
   const username = msg.from.username ? `@${msg.from.username}` : msg.from.first_name;
   notifyAdmins(
     `💬 *User Message*\n\n` +
