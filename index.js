@@ -19,8 +19,7 @@ const SHORTCODE       = process.env.SHORTCODE;
 const PASSKEY         = process.env.PASSKEY;
 const CONSUMER_KEY    = process.env.CONSUMER_KEY;
 const CONSUMER_SECRET = process.env.CONSUMER_SECRET;
-const CALLBACK_URL    = process.env.CALLBACK_URL;
-const ACCESS_LINK     = process.env.ACCESS_LINK || "";
+const CALLBACK_URL    = process.env.CALLBACK_URL|| "";
 
 // ─── EARLY ENV VALIDATION ─────────────────────────────────────────────────────
 // Runs at startup and notifies admins immediately if any critical variable is missing
@@ -367,7 +366,7 @@ async function stkPush(phone, amount, chatId) {
       TransactionType: "CustomerBuyGoodsOnline",
       Amount: Math.ceil(Number(amount)),
       PartyA: normalized,
-      PartyB: SHORTCODE,
+      PartyB: TILL_NUMBER,
       PhoneNumber: normalized,
       CallBackURL: CALLBACK_URL,
       AccountReference: "ALJAKI",
