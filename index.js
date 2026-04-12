@@ -12,7 +12,23 @@ app.use(express.json());
 // ─── HEALTH CHECK (keep-alive target + uptime monitors) ──────────────────────
 app.get("/", (req, res) => res.status(200).send("OK"));
 
-const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true });
+const bot = new TelegramBot(process.env.BOT_TOKEN, {
+  polling: {
+    autoStart: true,
+    params: { timeout: 10 }
+  }
+});
+
+bot.on("polling_error", (err) => {
+  if (err.code === "ETELEGRAM" && err.message.includes("409")) {
+    console.warn("⚠️ 409 Conflict — another instance is running. Restarting polling in 5s...");
+    setTimeout(() => {
+      bot.stopPolling().then(() => bot.startPolling()).catch(() => {});
+    }, 5000);
+  } else {
+    console.error("Polling error:", err.message);
+  }
+});
 
 // ─── CONFIG ──────────────────────────────────────────────────────────────────
 const TILL_NUMBER     = "4902476";
