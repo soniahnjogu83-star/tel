@@ -9,6 +9,9 @@ const TelegramBot = require("node-telegram-bot-api");
 const app = express();
 app.use(express.json());
 
+// ─── HEALTH CHECK (keep-alive target + uptime monitors) ──────────────────────
+app.get("/", (req, res) => res.status(200).send("OK"));
+
 const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true });
 
 // ─── CONFIG ──────────────────────────────────────────────────────────────────
@@ -1216,4 +1219,19 @@ app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`📡 M-Pesa callback URL: ${CALLBACK_URL || "⚠️ NOT SET"}`);
   console.log(`📺 Channel ID: ${CHANNEL_ID}`);
+
+  // ─── KEEP ALIVE (prevents Render free tier from sleeping) ────────────────
+  const RENDER_URL = process.env.RENDER_EXTERNAL_URL
+    || (CALLBACK_URL ? CALLBACK_URL.replace("/mpesa/callback", "") : null);
+
+  if (RENDER_URL) {
+    console.log(`🏓 Keep-alive enabled → pinging ${RENDER_URL} every 10 min`);
+    setInterval(() => {
+      axios.get(RENDER_URL)
+        .then(() => console.log("🏓 Keep-alive ping OK"))
+        .catch((err) => console.warn("🏓 Keep-alive ping failed:", err.message));
+    }, 10 * 60 * 1000);
+  } else {
+    console.warn("⚠️ Keep-alive disabled — set RENDER_EXTERNAL_URL in env vars");
+  }
 });
