@@ -19,10 +19,9 @@ const SHORTCODE       = process.env.SHORTCODE;
 const PASSKEY         = process.env.PASSKEY;
 const CONSUMER_KEY    = process.env.CONSUMER_KEY;
 const CONSUMER_SECRET = process.env.CONSUMER_SECRET;
-const CALLBACK_URL    = process.env.CALLBACK_URL|| "";
+const CALLBACK_URL    = process.env.CALLBACK_URL || "";
 
-// ─── EARLY ENV VALIDATION ─────────────────────────────────────────────────────
-// Runs at startup and notifies admins immediately if any critical variable is missing
+// ─── EARLY ENV VALIDATION ────────────────────────────────────────────────────
 (function validateEnv() {
   const required = {
     BOT_TOKEN:       process.env.BOT_TOKEN,
@@ -46,7 +45,6 @@ const CALLBACK_URL    = process.env.CALLBACK_URL|| "";
 
     console.error("❌ Missing env vars:", missing.join(", "));
 
-    // Notify admins after a short delay (bot needs a moment to connect)
     setTimeout(() => {
       ADMIN_IDS.forEach((id) => {
         bot.sendMessage(id, msg, { parse_mode: "Markdown" }).catch(() => {});
@@ -71,13 +69,23 @@ const PLAN_DAYS = {
 
 const subTimers = {};
 
+// ─── TYPING INDICATOR ────────────────────────────────────────────────────────
+// Shows typing action to reduce perceived delay on slow responses
+async function sendTyping(chatId, durationMs = 1500) {
+  try {
+    await bot.sendChatAction(chatId, "typing");
+    await new Promise((r) => setTimeout(r, durationMs));
+  } catch (_) {}
+}
+
+// ─── GRANT ACCESS ────────────────────────────────────────────────────────────
 async function grantAccess(chatId, planLabel, paymentSummary) {
   try {
     const days       = PLAN_DAYS[planLabel] || 30;
     const expireDate = Math.floor(Date.now() / 1000) + days * 86400;
 
     const inviteRes  = await bot.createChatInviteLink(CHANNEL_ID, {
-      member_limit: 1,
+      member_limit: 1,           // Single-use link — expires once someone joins
       expire_date:  expireDate,
       name:         `Access-${chatId}`
     });
@@ -87,16 +95,17 @@ async function grantAccess(chatId, planLabel, paymentSummary) {
       `🎉 *Access Granted!*\n\n` +
       `${paymentSummary}\n\n` +
       `Tap below to join 👇\n${inviteLink}\n\n` +
-      `⚠️ This link is *single-use* — it works for you only.\n` +
+      `⚠️ This link is *single-use* — it works for you only. Once you join the channel, the link expires automatically.\n` +
       `⏳ Your access expires in *${days} day(s)*.\n\n` +
       `_Welcome to the family!_ 🔐`,
       { parse_mode: "Markdown" }
     );
 
     clearSubTimers(chatId);
-    const timers = {};
+    const timers     = {};
     timers.expiresAt = Date.now() + days * 86400 * 1000;
 
+    // 24-hour expiry warning
     if (days > 1) {
       timers.warnTimer = setTimeout(() => {
         bot.sendMessage(chatId,
@@ -115,6 +124,7 @@ async function grantAccess(chatId, planLabel, paymentSummary) {
       }, (days - 1) * 86400 * 1000);
     }
 
+    // Kick on expiry — ban then immediately unban removes from channel
     timers.kickTimer = setTimeout(async () => {
       try {
         await bot.banChatMember(CHANNEL_ID, chatId);
@@ -159,12 +169,21 @@ function clearSubTimers(chatId) {
 }
 
 // ─── USDT CONFIG ─────────────────────────────────────────────────────────────
-const USDT_WALLET  = "TH25gdz6zpuaxYjWMemKYt8eRjvYVfTFrp";
+const USDT_WALLET  = "TQQ7Y4PKNs2rMuN2AzHGc2k43MuyMvrjy9";
 const USDT_NETWORK = "TRC20 (Tron)";
 const pendingUSDT  = {};
 
-function toUsdt(kshPrice) {
-  return parseFloat((kshPrice / 10).toFixed(2));
+// USDT prices per plan (USD)
+const USDT_PRICES = {
+  "1 Day":    5,
+  "1 Week":   19,
+  "1 Month":  35,
+  "6 Months": 90,
+  "1 Year":   250,
+};
+
+function getUsdtPrice(planLabel) {
+  return USDT_PRICES[planLabel] || null;
 }
 
 // ─── STORE ───────────────────────────────────────────────────────────────────
@@ -275,7 +294,7 @@ function scheduleReminders(chatId) {
         `Sometimes M-Pesa gets a little moody. If anything went sideways, I'm here to sort it out. 🛠️\n\n` +
         `Or if you're still thinking about it — your *${pkg}* spot is still open. 😊`,
       keyboard: [
-        [{ text: "✅ Complete My Purchase", callback_data: "show_till" }],
+        [{ text: "✅ Complete My Purchase", callback_data: "pay_stk" }],
         [{ text: "⚠️ I Had an Issue",       callback_data: "need_help" }],
         [{ text: "🚫 Not Interested",        callback_data: "dismiss_reminder" }]
       ]
@@ -286,7 +305,7 @@ function scheduleReminders(chatId) {
         `🔍 Noticed your session is still open — no pressure at all, just wanted to make sure everything's good on your end.\n\n` +
         `Your selected plan${price ? ` (*Ksh ${price}*)` : ""} is waiting whenever you're ready. Take your time. ⏳`,
       keyboard: [
-        [{ text: "💳 I'm Ready to Pay",     callback_data: "show_till" }],
+        [{ text: "💳 I'm Ready to Pay",     callback_data: "pay_stk" }],
         [{ text: "🔄 See Packages Again",    callback_data: "change_package" }],
         [{ text: "🚫 Dismiss",               callback_data: "dismiss_reminder" }]
       ]
@@ -298,7 +317,7 @@ function scheduleReminders(chatId) {
         `If there's anything holding you back (price, payment, anything), just say the word and we'll figure it out together. 🤝`,
       keyboard: [
         [{ text: "💬 I Have a Question", callback_data: "need_help" }],
-        [{ text: "✅ Let's Do This",      callback_data: "show_till" }],
+        [{ text: "✅ Let's Do This",      callback_data: "pay_stk" }],
         [{ text: "🚫 No Thanks",          callback_data: "dismiss_reminder" }]
       ]
     }
@@ -330,7 +349,6 @@ async function getMpesaToken() {
     return res.data.access_token;
   } catch (err) {
     console.error("❌ Token error:", err.response?.data || err.message);
-    // Notify admins so they know token fetch is failing
     notifyAdmins(
       `🚨 *Daraja Token Error*\n\n` +
       `Could not fetch M-Pesa access token.\n\n` +
@@ -344,9 +362,9 @@ async function getMpesaToken() {
 // ─── M-PESA: STK PUSH ─────────────────────────────────────────────────────────
 async function stkPush(phone, amount, chatId) {
   try {
-    const token = await getMpesaToken();
+    const token     = await getMpesaToken();
     const timestamp = moment().format("YYYYMMDDHHmmss");
-    const password = Buffer.from(`${SHORTCODE}${PASSKEY}${timestamp}`).toString("base64");
+    const password  = Buffer.from(`${SHORTCODE}${PASSKEY}${timestamp}`).toString("base64");
 
     let normalized = phone.trim();
     normalized = normalized.replace(/^\+/, "");
@@ -361,16 +379,16 @@ async function stkPush(phone, amount, chatId) {
 
     const payload = {
       BusinessShortCode: SHORTCODE,
-      Password: password,
-      Timestamp: timestamp,
-      TransactionType: "CustomerBuyGoodsOnline",
-      Amount: Math.ceil(Number(amount)),
-      PartyA: normalized,
-      PartyB: TILL_NUMBER,
-      PhoneNumber: normalized,
-      CallBackURL: CALLBACK_URL,
-      AccountReference: "ALJAKI",
-      TransactionDesc: "Content Access"
+      Password:          password,
+      Timestamp:         timestamp,
+      TransactionType:   "CustomerBuyGoodsOnline",
+      Amount:            Math.ceil(Number(amount)),
+      PartyA:            normalized,
+      PartyB:            TILL_NUMBER,
+      PhoneNumber:       normalized,
+      CallBackURL:       CALLBACK_URL,
+      AccountReference:  "ALJAKI",
+      TransactionDesc:   "Content Access"
     };
 
     console.log("📤 STK Payload:", JSON.stringify(payload, null, 2));
@@ -380,7 +398,7 @@ async function stkPush(phone, amount, chatId) {
       payload,
       {
         headers: {
-          Authorization: `Bearer ${token}`,
+          Authorization:  `Bearer ${token}`,
           "Content-Type": "application/json"
         }
       }
@@ -403,7 +421,6 @@ async function stkPush(phone, amount, chatId) {
     return res.data;
   } catch (err) {
     console.error("❌ FULL STK ERROR:", JSON.stringify(err.response?.data, null, 2) || err.message);
-
     notifyAdmins(
       `🚨 *STK Push Failed*\n\n` +
       `Chat ID: \`${chatId}\`\n` +
@@ -411,10 +428,10 @@ async function stkPush(phone, amount, chatId) {
       `Amount: \`${amount}\`\n\n` +
       `Error: \`${JSON.stringify(err.response?.data || err.message)}\``
     );
-
     throw err;
   }
 }
+
 // ─── M-PESA CALLBACK ──────────────────────────────────────────────────────────
 app.post("/mpesa/callback", (req, res) => {
   res.status(200).json({ ResultCode: 0, ResultDesc: "Accepted" });
@@ -435,10 +452,10 @@ app.post("/mpesa/callback", (req, res) => {
       const mpesaCode = get("MpesaReceiptNumber");
       const phone     = get("PhoneNumber");
 
-      const sel   = userSelections[chatId] || {};
-      sel.paidAt  = new Date().toISOString();
-      sel.stkRef  = mpesaCode;
-      sel.phone   = phone;
+      const sel  = userSelections[chatId] || {};
+      sel.paidAt = new Date().toISOString();
+      sel.stkRef = mpesaCode;
+      sel.phone  = phone;
       userSelections[chatId] = sel;
 
       clearReminders(chatId);
@@ -464,19 +481,25 @@ app.post("/mpesa/callback", (req, res) => {
         `💰 Amount: *Ksh ${amount}*\n` +
         `🧾 M-Pesa Ref: \`${mpesaCode}\`\n` +
         `📱 Phone: ${phone}\n\n` +
-        `➡️ Send access with:\n\`/send ${chatId} <link>\``
+        `➡️ Access sent automatically.`
       );
     } else {
+      // STK failed — now show manual till as fallback
+      const sel = userSelections[chatId] || {};
       bot.sendMessage(chatId,
-        `⚠️ *Payment wasn't completed.*\n\n` +
-        `No worries — it happens! You can try again below or use the manual M-Pesa option.\n\n` +
-        `_Did something go wrong? Tap "I Need Help" and we'll sort it out._ 🛠️`,
+        `⚠️ *Payment prompt was not completed.*\n\n` +
+        `No worries — this sometimes happens when:\n` +
+        `• The M-Pesa prompt timed out\n` +
+        `• Wrong PIN was entered\n` +
+        `• Network was unstable\n\n` +
+        `You can pay manually via M-Pesa till instead 👇`,
         {
           parse_mode: "Markdown",
           reply_markup: {
             inline_keyboard: [
-              [{ text: "🔄 Try Again",    callback_data: "show_till" }],
-              [{ text: "❓ I Need Help",  callback_data: "need_help" }]
+              [{ text: "💳 Pay Manually via Till",  callback_data: "show_till" }],
+              [{ text: "🔄 Try STK Push Again",     callback_data: "pay_stk" }],
+              [{ text: "❓ I Need Help",             callback_data: "need_help" }]
             ]
           }
         }
@@ -499,7 +522,9 @@ async function startUsdtPoller(chatId, expectedUsdt) {
       if (Date.now() > expiresAt) {
         stopUsdtPoller(chatId);
         bot.sendMessage(chatId,
-          `⏰ *Payment window expired.*\n\nYour USDT payment wasn't detected within 30 minutes.\n\nNo worries — tap below to try again or switch to M-Pesa.`,
+          `⏰ *Payment window expired.*\n\n` +
+          `Your USDT payment wasn't detected within 30 minutes.\n\n` +
+          `No worries — tap below to try again or switch to M-Pesa.`,
           {
             parse_mode: "Markdown",
             reply_markup: {
@@ -530,9 +555,9 @@ async function startUsdtPoller(chatId, expectedUsdt) {
           stopUsdtPoller(chatId);
           clearReminders(chatId);
 
-          const sel   = userSelections[chatId] || {};
-          sel.paidAt  = new Date().toISOString();
-          sel.stkRef  = tx.transaction_id;
+          const sel  = userSelections[chatId] || {};
+          sel.paidAt = new Date().toISOString();
+          sel.stkRef = tx.transaction_id;
           userSelections[chatId] = sel;
 
           recordPayment({
@@ -557,7 +582,7 @@ async function startUsdtPoller(chatId, expectedUsdt) {
             `⏱  Plan: *${sel.plan || "N/A"}*\n` +
             `💰 Amount: *$${received} USDT*\n` +
             `🧾 TxID: \`${tx.transaction_id}\`\n\n` +
-            `➡️ Send access with:\n\`/send ${chatId} <link>\``
+            `➡️ Access sent automatically.`
           );
           return;
         }
@@ -578,13 +603,16 @@ function stopUsdtPoller(chatId) {
 }
 
 // ─── /start ──────────────────────────────────────────────────────────────────
-bot.onText(/\/start/, (msg) => {
+bot.onText(/\/start/, async (msg) => {
   const chatId   = msg.chat.id;
   const username = msg.from.username ? `@${msg.from.username}` : msg.from.first_name;
   console.log(`👤 /start — ${username} (${chatId})`);
 
+  // Show typing indicator so user knows bot received the command
+  await sendTyping(chatId, 1200);
+
   bot.sendMessage(chatId,
-    `Welcome ${username} 🚀\n\nSelect your preferred package below:`,
+    `Welcome ${username} 🚀\n\nSorry for any delay — I'm here now! Select your preferred package below:`,
     {
       reply_markup: {
         inline_keyboard: [
@@ -619,24 +647,12 @@ bot.onText(/\/buy/, (msg) => {
     return bot.sendMessage(chatId, "⚠️ Please select a package and plan first using /start.");
   }
 
+  // Trigger STK push flow directly
+  userSelections[chatId].awaitingPhone = true;
   bot.sendMessage(chatId,
-    `✅ *Almost there!*\n\n\`\`\`\n${tillCard(sel.package, sel.plan, sel.price)}\n\`\`\`\n\n` +
-    `📲 *How to pay:*\n` +
-    `1️⃣ Open M-Pesa → *Lipa na M-Pesa → Buy Goods*\n` +
-    `2️⃣ Till: *${TILL_NUMBER}*\n` +
-    `3️⃣ Amount: *Ksh ${sel.price}*\n` +
-    `4️⃣ Enter PIN & confirm\n\n` +
-    `After paying, tap below 👇`,
-    {
-      parse_mode: "Markdown",
-      reply_markup: {
-        inline_keyboard: [
-          [{ text: "✅ I've Paid — Confirm My Access", callback_data: "confirm_payment" }],
-          [{ text: "🔄 Change Package",                callback_data: "change_package" }],
-          [{ text: "❓ I Need Help",                    callback_data: "need_help" }]
-        ]
-      }
-    }
+    `📱 *Enter your M-Pesa phone number* and we'll send you a payment prompt directly.\n\n` +
+    `Format: *07XXXXXXXX* or *01XXXXXXXX*`,
+    { parse_mode: "Markdown" }
   );
 });
 
@@ -727,10 +743,10 @@ bot.onText(/\/stats/, (msg) => {
   if (!ADMIN_IDS.includes(String(msg.chat.id))) {
     return bot.sendMessage(msg.chat.id, "⛔ Not authorized.");
   }
-  const all      = Object.values(userSelections);
-  const paid     = all.filter((s) => s.paidAt).length;
-  const unpaid   = all.length - paid;
-  const revenue  = all.filter((s) => s.paidAt && s.price).reduce((sum, s) => sum + Number(s.price), 0);
+  const all       = Object.values(userSelections);
+  const paid      = all.filter((s) => s.paidAt).length;
+  const unpaid    = all.length - paid;
+  const revenue   = all.filter((s) => s.paidAt && s.price).reduce((sum, s) => sum + Number(s.price), 0);
   const usdtPending = Object.keys(pendingUSDT).length;
 
   bot.sendMessage(msg.chat.id,
@@ -854,9 +870,8 @@ bot.onText(/\/reply (\d+) (.+)/, (msg, match) => {
   });
 });
 
-// ─── INCOMING TEXT MESSAGES (phone number capture for STK push) ───────────────
+// ─── INCOMING TEXT MESSAGES ───────────────────────────────────────────────────
 bot.on("message", async (msg) => {
-  // Ignore commands
   if (!msg.text || msg.text.startsWith("/")) return;
 
   const chatId = msg.chat.id;
@@ -867,10 +882,9 @@ bot.on("message", async (msg) => {
     sel.awaitingPhone = false;
     userSelections[chatId] = sel;
 
-    const phone = msg.text.trim();
-
-    // Basic client-side format check before hitting API
+    const phone   = msg.text.trim();
     const cleaned = phone.replace(/^\+/, "").replace(/^0/, "254");
+
     if (!/^2547\d{8}$|^2541\d{8}$/.test(cleaned)) {
       return bot.sendMessage(chatId,
         `⚠️ *Invalid phone number.*\n\nPlease enter a valid Safaricom number:\n• *07XXXXXXXX*\n• *01XXXXXXXX*`,
@@ -878,6 +892,7 @@ bot.on("message", async (msg) => {
       );
     }
 
+    await sendTyping(chatId, 1000);
     await bot.sendMessage(chatId,
       `⏳ *Sending STK push to ${phone}...*\n\nCheck your phone now and enter your M-Pesa PIN. 📲`,
       { parse_mode: "Markdown" }
@@ -894,10 +909,11 @@ bot.on("message", async (msg) => {
           { parse_mode: "Markdown" }
         );
       } else {
+        // STK push returned non-zero — fall back to manual till
         await bot.sendMessage(chatId,
           `⚠️ *Could not send payment prompt.*\n\n` +
           `Reason: _${result.ResponseDescription || result.CustomerMessage || "Unknown error"}_\n\n` +
-          `Try the manual till option instead 👇`,
+          `No worries — you can pay manually via M-Pesa till below 👇`,
           {
             parse_mode: "Markdown",
             reply_markup: {
@@ -912,10 +928,11 @@ bot.on("message", async (msg) => {
       }
     } catch (err) {
       console.error("STK handler error:", err.message);
+      // Any exception — fall back to manual till
       await bot.sendMessage(chatId,
         `❌ *Payment request failed.*\n\n` +
         `_${err.response?.data?.errorMessage || err.message}_\n\n` +
-        `Please try the manual till option or contact support. 🛠️`,
+        `Don't worry — you can still pay manually via M-Pesa till 👇`,
         {
           parse_mode: "Markdown",
           reply_markup: {
@@ -937,7 +954,7 @@ bot.on("message", async (msg) => {
       {
         reply_markup: {
           inline_keyboard: [
-            [{ text: "✅ Continue Purchase", callback_data: "show_till" }],
+            [{ text: "✅ Continue Purchase", callback_data: "pay_stk" }],
             [{ text: "🔄 Start Over",        callback_data: "change_package" }]
           ]
         }
@@ -952,6 +969,9 @@ bot.on("callback_query", async (query) => {
   const data   = query.data;
 
   bot.answerCallbackQuery(query.id).catch(() => {});
+
+  // Show typing briefly for any callback to reduce perceived delay
+  await sendTyping(chatId, 600);
 
   // ── Package selection ──
   if (data === "package_naughty_premium_leaks") {
@@ -1061,7 +1081,18 @@ bot.on("callback_query", async (query) => {
 
     const backTarget = data.startsWith("naughty_") ? "package_naughty_premium_leaks" : "package_naughty_explicit";
     scheduleReminders(chatId);
-    const usdtPrice = toUsdt(plan.price);
+
+    // Get USDT price for this plan (2 weeks has no USDT option — fallback to M-Pesa only)
+    const usdtPrice = getUsdtPrice(plan.label);
+    const cryptoBtn = usdtPrice
+      ? [{ text: `₿ Pay with Crypto  ($${usdtPrice} USDT)`, callback_data: "pay_usdt" }]
+      : null;
+
+    const keyboard = [
+      [{ text: `📲 Pay via STK Push (Recommended)`, callback_data: "pay_stk" }],
+      ...(cryptoBtn ? [[cryptoBtn[0]]] : []),
+      [{ text: `⬅️ Change Plan`, callback_data: `back_to_${backTarget}` }]
+    ];
 
     return bot.sendMessage(chatId,
       `✅ *${sel.package}* — *${plan.label}* selected\n` +
@@ -1069,14 +1100,7 @@ bot.on("callback_query", async (query) => {
       `How would you like to pay?`,
       {
         parse_mode: "Markdown",
-        reply_markup: {
-          inline_keyboard: [
-            [{ text: `📲 Pay via STK Push (Auto)`,  callback_data: "pay_stk" }],
-            [{ text: `💳 Pay Manually via Till`,     callback_data: "show_till" }],
-            [{ text: `₿ Use Crypto Instead`,        callback_data: "pay_usdt" }],
-            [{ text: `⬅️ Change Plan`,               callback_data: `back_to_${backTarget}` }]
-          ]
-        }
+        reply_markup: { inline_keyboard: keyboard }
       }
     );
   }
@@ -1095,54 +1119,14 @@ bot.on("callback_query", async (query) => {
     );
   }
 
-  // ── USDT Payment ──
-  if (data === "pay_usdt") {
-    const sel = userSelections[chatId];
-    if (!sel || !sel.price) {
-      return bot.sendMessage(chatId, "⚠️ Please start over with /start.");
-    }
-    const usdtAmount  = toUsdt(sel.price);
-    sel.usdtAmount    = usdtAmount;
-    userSelections[chatId] = sel;
-
-    await bot.sendMessage(chatId,
-      `₿ *Pay with Crypto*\n\n` +
-      `🌍 *Why pay with crypto?*\n` +
-      `• ✅ *100% Anonymous* — no name, no bank, no trace\n` +
-      `• ⚡ *Instant* — auto-detected, access granted automatically\n` +
-      `• 🔒 *Secure* — blockchain-verified, no chargebacks\n` +
-      `• 🌐 *Global* — works from anywhere in the world\n` +
-      `• 💸 *No middleman* — direct wallet-to-wallet\n\n` +
-      `💎 *Accepted:* USDT (TRC20 / Tron Network)\n\n` +
-      `📦 *${sel.package}* — *${sel.plan}*\n` +
-      `💰 Amount: *$${usdtAmount} USDT*`,
-      { parse_mode: "Markdown" }
-    );
-
-    await bot.sendMessage(chatId,
-      `📤 *Send Payment*\n\n` +
-      `Send *exactly $${usdtAmount} USDT* to this TRC20 address:\n\n` +
-      `\`${USDT_WALLET}\`\n\n` +
-      `⚠️ *Important:*\n` +
-      `• Use *TRC20 network only* (Tron)\n` +
-      `• Send the exact amount — $${usdtAmount} USDT\n` +
-      `• Payment window: *30 minutes*\n\n` +
-      `_We're watching for your transaction. Access will be activated automatically once detected._ 🔍`,
-      { parse_mode: "Markdown" }
-    );
-
-    await startUsdtPoller(chatId, usdtAmount);
-    return;
-  }
-
-  // ── Show manual till ──
+  // ── Manual till (only shown as fallback after STK failure) ──
   if (data === "show_till") {
     const sel = userSelections[chatId];
     if (!sel || !sel.price) {
       return bot.sendMessage(chatId, "⚠️ Please start over with /start.");
     }
     return bot.sendMessage(chatId,
-      `⚡ *Let's get you in!*\n\n` +
+      `💳 *Manual M-Pesa Payment*\n\n` +
       `\`\`\`\n${tillCard(sel.package, sel.plan, sel.price)}\n\`\`\`\n\n` +
       `📲 *Steps:*\n` +
       `➊ Open M-Pesa\n` +
@@ -1187,6 +1171,68 @@ bot.on("callback_query", async (query) => {
     );
   }
 
+  // ── USDT Payment ──
+  if (data === "pay_usdt") {
+    const sel = userSelections[chatId];
+    if (!sel || !sel.plan) {
+      return bot.sendMessage(chatId, "⚠️ Please start over with /start.");
+    }
+
+    const usdtAmount = getUsdtPrice(sel.plan);
+    if (!usdtAmount) {
+      return bot.sendMessage(chatId,
+        `⚠️ Crypto payment is not available for the *2 Weeks* plan.\n\nPlease choose another plan or pay via M-Pesa.`,
+        {
+          parse_mode: "Markdown",
+          reply_markup: { inline_keyboard: [[{ text: "📲 Pay via STK Push", callback_data: "pay_stk" }]] }
+        }
+      );
+    }
+
+    sel.usdtAmount      = usdtAmount;
+    userSelections[chatId] = sel;
+
+    // Message 1: Why USDT
+    await bot.sendMessage(chatId,
+      `₿ *Pay with Crypto (USDT)*\n\n` +
+      `🌍 *Why pay with crypto?*\n` +
+      `• ✅ *100% Anonymous* — no name, no bank, no trace\n` +
+      `• ⚡ *Instant* — auto-detected, access granted automatically\n` +
+      `• 🔒 *Secure* — blockchain-verified\n` +
+      `• 🌐 *Global* — works from anywhere in the world\n\n` +
+      `📦 *${sel.package}* — *${sel.plan}*\n` +
+      `💰 Amount: *$${usdtAmount} USDT*`,
+      { parse_mode: "Markdown" }
+    );
+
+    // Message 2: Payment instructions with strong TRC20 disclaimer
+    await bot.sendMessage(chatId,
+      `📤 *How to Send Payment*\n\n` +
+      `Send *exactly $${usdtAmount} USDT* to the address below:\n\n` +
+      `\`${USDT_WALLET}\`\n\n` +
+      `━━━━━━━━━━━━━━━━━━━━━━━━\n` +
+      `🚨 *IMPORTANT — READ BEFORE SENDING* 🚨\n` +
+      `━━━━━━━━━━━━━━━━━━━━━━━━\n\n` +
+      `✅ *CORRECT network:* Tron (TRC20) *ONLY*\n` +
+      `❌ *WRONG:* ERC20 (Ethereum)\n` +
+      `❌ *WRONG:* BEP20 (Binance Smart Chain)\n` +
+      `❌ *WRONG:* Any other network\n\n` +
+      `⛔ *This address only supports Tron (TRC20). Any amount sent to the wrong address or network will result in the permanent loss of your funds. We cannot recover such payments under any circumstances.*\n\n` +
+      `━━━━━━━━━━━━━━━━━━━━━━━━\n\n` +
+      `📋 *Checklist before sending:*\n` +
+      `☑️ I am sending *USDT*, not any other coin\n` +
+      `☑️ I selected *TRC20 / Tron* as the network\n` +
+      `☑️ The address starts with *T* (all Tron addresses start with T)\n` +
+      `☑️ I am sending *exactly $${usdtAmount} USDT*\n\n` +
+      `⏳ Payment window: *30 minutes*\n\n` +
+      `_We're watching for your transaction. Access will be activated automatically once detected._ 🔍`,
+      { parse_mode: "Markdown" }
+    );
+
+    await startUsdtPoller(chatId, usdtAmount);
+    return;
+  }
+
   // ── Need help ──
   if (data === "need_help") {
     return bot.sendMessage(chatId,
@@ -1200,7 +1246,7 @@ bot.on("callback_query", async (query) => {
         parse_mode: "Markdown",
         reply_markup: {
           inline_keyboard: [
-            [{ text: "🔄 Try Again",         callback_data: "pay_stk" }],
+            [{ text: "🔄 Try STK Again",     callback_data: "pay_stk" }],
             [{ text: "💳 Manual Till",        callback_data: "show_till" }],
             [{ text: "🔁 Change Package",     callback_data: "change_package" }]
           ]
