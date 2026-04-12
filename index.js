@@ -133,14 +133,20 @@ async function grantAccess(rawChatId, planLabel, paymentSummary) {
 
   try {
     // ── Pre-kick: remove user first so single-use link always works ──────────
-    // This handles the case where the user is already in the channel (renewal).
+    // Skip if the user is a channel admin — admins cannot be kicked.
     try {
-      await bot.banChatMember(CHANNEL_ID, Number(chatId));
-      await bot.unbanChatMember(CHANNEL_ID, Number(chatId));
-      console.log(`🔄 Pre-kick done for ${chatId} (safe to ignore if not in channel)`);
+      const member = await bot.getChatMember(CHANNEL_ID, Number(chatId));
+      const isAdmin = ["administrator", "creator"].includes(member.status);
+      if (isAdmin) {
+        console.log(`ℹ️ Pre-kick skipped for ${chatId} — user is a channel admin.`);
+      } else {
+        await bot.banChatMember(CHANNEL_ID, Number(chatId));
+        await bot.unbanChatMember(CHANNEL_ID, Number(chatId));
+        console.log(`🔄 Pre-kick done for ${chatId}`);
+      }
     } catch (preKickErr) {
-      // Not in channel or bot lacks permission — not fatal, continue
-      console.warn(`⚠️ Pre-kick skipped for ${chatId}: ${preKickErr.message}`);
+      // User not in channel, or any other non-fatal error — safe to continue
+      console.log(`ℹ️ Pre-kick skipped for ${chatId}: ${preKickErr.message}`);
     }
 
     const expireDate = Math.floor(Date.now() / 1000) + days * 86400;
@@ -773,15 +779,47 @@ bot.onText(/\/grant (\d+)/, async (msg, match) => {
 
 bot.onText(/\/pending/, (msg) => {
   if (!ADMIN_IDS.includes(cid(msg.chat.id))) return bot.sendMessage(cid(msg.chat.id), "⛔ Not authorized.");
-  const entries = Object.entries(pendingSTK);
-  if (!entries.length) return bot.sendMessage(cid(msg.chat.id), "📭 No pending STK transactions.");
-  const lines = entries.map(([id, p]) =>
-    `• \`${id}\`\n  👤 \`${p.chatId}\` | ${p.pkg || "—"} / ${p.plan || "—"} | Ksh ${p.price || "—"}`
-  );
-  bot.sendMessage(cid(msg.chat.id),
-    `⏳ *Pending STK Pushes (${entries.length})*\n\n${lines.join("\n\n")}\n\n_Use /grant <chatId> if callback was missed._`,
-    { parse_mode: "Markdown" }
-  );
+
+  const stkEntries      = Object.entries(pendingSTK);
+  const receiptEntries  = Object.entries(awaitingReceipt).filter(([, r]) => r.code);
+
+  if (!stkEntries.length && !receiptEntries.length) {
+    return bot.sendMessage(cid(msg.chat.id), "📭 No pending transactions.");
+  }
+
+  let message = "";
+
+  if (stkEntries.length) {
+    const lines = stkEntries.map(([id, p]) =>
+      `• 🔑 \`${id}\`\n  👤 \`${p.chatId}\` | ${p.pkg || "—"} / ${p.plan || "—"} | Ksh ${p.price || "—"}`
+    );
+    message += `⏳ *Pending STK Pushes (${stkEntries.length})*\n\n${lines.join("\n\n")}\n\n_/grant <chatId> if callback was missed._\n\n`;
+  }
+
+  if (receiptEntries.length) {
+    const lines = receiptEntries.map(([id, r]) =>
+      `• 👤 \`${id}\` | ${r.pkg || "—"} / ${r.plan || "—"} | Ksh ${r.price || "—"}\n  🧾 Code: \`${r.code}\``
+    );
+    message += `🔔 *Awaiting Receipt Verification (${receiptEntries.length})*\n\n${lines.join("\n\n")}`;
+  }
+
+  // Send with one-tap approve buttons for each receipt
+  bot.sendMessage(cid(msg.chat.id), message.trim(), { parse_mode: "Markdown" }).catch(() => {});
+
+  // Send individual approve buttons for each pending receipt
+  receiptEntries.forEach(([id, r]) => {
+    bot.sendMessage(cid(msg.chat.id),
+      `👤 \`${id}\` — \`${r.code}\` — ${r.plan || "1 Month"}`,
+      {
+        parse_mode: "Markdown",
+        reply_markup: {
+          inline_keyboard: [[
+            { text: `✅ Approve & Grant Access to ${id}`, callback_data: `admin_grant_${id}_${r.plan || "1 Month"}` }
+          ]]
+        }
+      }
+    ).catch(() => {});
+  });
 });
 
 bot.onText(/\/users/, (msg) => {
@@ -895,8 +933,6 @@ bot.on("message", async (msg) => {
   // ── Handle M-Pesa receipt code submitted by user ──────────────────────────
   if (awaitingReceipt[chatId]) {
     const receiptInfo = awaitingReceipt[chatId];
-    delete awaitingReceipt[chatId];
-
     const code = text.toUpperCase();
 
     if (!/^[A-Z0-9]{10}$/.test(code)) {
@@ -913,6 +949,9 @@ bot.on("message", async (msg) => {
         }
       );
     }
+
+    // Store code so /pending can show it; will be cleared on admin approval
+    awaitingReceipt[chatId] = { ...receiptInfo, code };
 
     notifyAdmins(
       `🔔 *Manual Receipt Submitted*\n\n` +
@@ -1006,17 +1045,94 @@ bot.on("message", async (msg) => {
     return;
   }
 
-  if (sel && !sel.paidAt) {
-    bot.sendMessage(chatId,
-      `👋 Still here! Use the buttons below to continue, or type /start to begin again.`,
+  // ── User typed something freely — try to detect an M-Pesa code ────────────
+  // Works even without awaitingReceipt: if it looks like a receipt, treat it.
+  const looksLikeCode = /^[A-Z0-9]{10}$/.test(text.toUpperCase());
+
+  if (looksLikeCode) {
+    const code = text.toUpperCase();
+    const sel2 = userSelections[chatId] || {};
+
+    // They've already paid — just a stray message, ignore gracefully
+    if (sel2.paidAt) {
+      return bot.sendMessage(chatId,
+        `✅ You already have active access! If you have an issue tap below.`,
+        { reply_markup: { inline_keyboard: [[{ text: "❓ I Need Help", callback_data: "need_help" }]] } }
+      );
+    }
+
+    // Looks legit — forward to admins with approve button
+    notifyAdmins(
+      `🔔 *Receipt Code Received (Free Text)*
+
+` +
+      `👤 ChatID: \`${chatId}\`
+` +
+      `📦 ${sel2.package || "N/A"} — ${sel2.plan || "N/A"}
+` +
+      `💰 Ksh ${sel2.price || "N/A"}
+` +
+      `🧾 M-Pesa Code: \`${code}\`
+
+` +
+      `Please verify then tap below to approve 👇`,
       {
         reply_markup: {
+          inline_keyboard: [[
+            { text: `✅ Approve & Send Access to ${chatId}`, callback_data: `admin_grant_${chatId}_${sel2.plan || "1 Month"}` }
+          ]]
+        }
+      }
+    );
+
+    // Store with code so /pending can display it
+    awaitingReceipt[chatId] = {
+      plan:  sel2.plan    || "1 Month",
+      pkg:   sel2.package || "N/A",
+      price: sel2.price   || 0,
+      code,
+    };
+
+    return bot.sendMessage(chatId,
+      `✅ *Got it!*
+
+` +
+      `We've received your M-Pesa code \`${code}\` and our team is verifying it right now. 🔍
+
+` +
+      `You'll receive your access link within a few minutes. Thank you for your patience! 🙏`,
+      { parse_mode: "Markdown" }
+    );
+  }
+
+  // ── User typed random text that is NOT a valid code ──────────────────────
+  if (sel && !sel.paidAt) {
+    return bot.sendMessage(chatId,
+      `😔 *Sorry, we didn't understand that.*
+
+` +
+      `If you've already paid, please send your *M-Pesa confirmation code* — it's the *10-character code* in your payment SMS, e.g. \`RCX4B2K9QP\`.
+
+` +
+      `If you haven't paid yet, choose an option below 👇`,
+      {
+        parse_mode: "Markdown",
+        reply_markup: {
           inline_keyboard: [
-            [{ text: "✅ Continue Purchase", callback_data: "pay_stk" }],
-            [{ text: "🔄 Start Over",        callback_data: "change_package" }]
+            [{ text: "📲 Pay via STK Push",    callback_data: "pay_stk" }],
+            [{ text: "💳 Pay Manually via Till", callback_data: "show_till" }],
+            [{ text: "❓ I Need Help",           callback_data: "need_help" }]
           ]
         }
       }
+    );
+  }
+
+  // Paid user said something random — friendly catch-all
+  if (sel && sel.paidAt) {
+    bot.sendMessage(chatId,
+      `👋 You're all set! If you need help tap below.`,
+      { reply_markup: { inline_keyboard: [[{ text: "❓ I Need Help", callback_data: "need_help" }]] } }
     ).catch(() => {});
   }
 });
@@ -1038,6 +1154,9 @@ bot.on("callback_query", async (query) => {
     const planLabel     = withoutPrefix.substring(underscoreIdx + 1);
 
     try {
+      // Clear from pending receipt list now that admin has approved
+      delete awaitingReceipt[targetId];
+
       await grantAccess(
         targetId,
         planLabel || "1 Month",
