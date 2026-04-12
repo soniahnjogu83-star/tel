@@ -21,6 +21,10 @@ const CONSUMER_KEY    = process.env.CONSUMER_KEY;
 const CONSUMER_SECRET = process.env.CONSUMER_SECRET;
 const CALLBACK_URL    = process.env.CALLBACK_URL || "";
 
+// ─── FIX 1: CHANNEL_ID as a NUMBER (not string) ──────────────────────────────
+// String channel IDs cause createChatInviteLink / banChatMember to fail silently
+const CHANNEL_ID = -1001567081082;
+
 // ─── EARLY ENV VALIDATION ────────────────────────────────────────────────────
 (function validateEnv() {
   const required = {
@@ -47,9 +51,7 @@ const CALLBACK_URL    = process.env.CALLBACK_URL || "";
   }
 })();
 
-// ─── CHANNEL CONFIG ──────────────────────────────────────────────────────────
-const CHANNEL_ID = "-1001567081082";
-
+// ─── PLAN CONFIG ─────────────────────────────────────────────────────────────
 const PLAN_DAYS = {
   "1 Day":    1,
   "1 Week":   7,
@@ -71,11 +73,33 @@ async function sendTyping(chatId, durationMs = 1500) {
 
 // ─── GRANT ACCESS ────────────────────────────────────────────────────────────
 async function grantAccess(chatId, planLabel, paymentSummary) {
-  try {
-    const days       = PLAN_DAYS[planLabel] || 30;
-    const expireDate = Math.floor(Date.now() / 1000) + days * 86400;
+  // FIX 2: Validate and resolve planLabel before doing anything
+  console.log(`🔍 grantAccess called: chatId=${chatId}, planLabel="${planLabel}"`);
 
-    console.log(`🔗 Creating invite link for ${chatId} | plan: ${planLabel} | days: ${days}`);
+  const resolvedLabel = PLAN_DAYS[planLabel] !== undefined ? planLabel : "1 Month";
+  if (resolvedLabel !== planLabel) {
+    console.warn(`⚠️ Unknown planLabel "${planLabel}" — falling back to "1 Month"`);
+  }
+
+  const days = PLAN_DAYS[resolvedLabel];
+  console.log(`📅 Days resolved: ${days} for plan "${resolvedLabel}"`);
+
+  // FIX 3: Validate days is a real number before using it
+  if (!days || isNaN(days)) {
+    console.error(`❌ grantAccess: could not resolve days for plan "${planLabel}"`);
+    notifyAdmins(
+      `⚠️ *grantAccess FAILED*\n\n` +
+      `ChatID: \`${chatId}\`\n` +
+      `Bad planLabel: \`${planLabel}\`\n\n` +
+      `Manual fix:\n\`/grant ${chatId}\``
+    );
+    return;
+  }
+
+  try {
+    // FIX 4: expire_date must be a valid integer (unix seconds)
+    const expireDate = Math.floor(Date.now() / 1000) + days * 86400;
+    console.log(`🔗 Creating invite link: chatId=${chatId}, days=${days}, expireDate=${expireDate}, CHANNEL_ID=${CHANNEL_ID}`);
 
     const inviteRes = await bot.createChatInviteLink(CHANNEL_ID, {
       member_limit: 1,
@@ -105,7 +129,7 @@ async function grantAccess(chatId, planLabel, paymentSummary) {
     if (days > 1) {
       timers.warnTimer = setTimeout(() => {
         bot.sendMessage(chatId,
-          `⏰ *Heads up!*\n\nYour *${planLabel}* access expires in *24 hours*.\n\nRenew now to stay connected 😊`,
+          `⏰ *Heads up!*\n\nYour *${resolvedLabel}* access expires in *24 hours*.\n\nRenew now to stay connected 😊`,
           {
             parse_mode: "Markdown",
             reply_markup: { inline_keyboard: [[{ text: "🔄 Renew My Access", callback_data: "change_package" }]] }
@@ -123,7 +147,7 @@ async function grantAccess(chatId, planLabel, paymentSummary) {
         console.error("Kick error:", e.message);
       }
       bot.sendMessage(chatId,
-        `👋 *Your access has ended.*\n\nYour *${planLabel}* plan has expired. We hope you enjoyed your time with us! 🙏\n\nWhenever you're ready to come back, we'll be here 😊`,
+        `👋 *Your access has ended.*\n\nYour *${resolvedLabel}* plan has expired. We hope you enjoyed your time with us! 🙏\n\nWhenever you're ready to come back, we'll be here 😊`,
         {
           parse_mode: "Markdown",
           reply_markup: { inline_keyboard: [[{ text: "🔄 Re-subscribe", callback_data: "change_package" }]] }
@@ -133,13 +157,13 @@ async function grantAccess(chatId, planLabel, paymentSummary) {
     }, days * 86400 * 1000);
 
     subTimers[chatId] = timers;
-    console.log(`✅ Access fully set up for ${chatId} | ${planLabel} | ${days}d`);
+    console.log(`✅ Access fully set up for ${chatId} | ${resolvedLabel} | ${days}d`);
 
   } catch (err) {
-    console.error("❌ grantAccess error:", err.message);
+    console.error("❌ grantAccess error:", err.message, err.stack);
     notifyAdmins(
       `⚠️ *Auto-invite FAILED for* \`${chatId}\`\n\n` +
-      `Plan: *${planLabel}*\n` +
+      `Plan: *${resolvedLabel}* (${days} days)\n` +
       `Error: \`${err.message}\`\n\n` +
       `*Fix:* Make sure the bot is a channel admin with "Invite Users via Link" permission.\n\n` +
       `*Manual fallback:*\n\`/grant ${chatId}\``
@@ -247,9 +271,9 @@ function tillCard(packageName, plan, price) {
     `╔══════════════════════════╗\n` +
     `║   💳  PAYMENT DETAILS    ║\n` +
     `╠══════════════════════════╣\n` +
-    `║  📦 ${packageName.substring(0, 22).padEnd(22)}║\n` +
-    `║  ⏱  Plan: ${plan.padEnd(18)}║\n` +
-    `║  💰 Amount: Ksh ${String(price).padEnd(11)}║\n` +
+    `║  📦 ${(packageName || "").substring(0, 22).padEnd(22)}║\n` +
+    `║  ⏱  Plan: ${(plan || "").padEnd(18)}║\n` +
+    `║  💰 Amount: Ksh ${String(price || 0).padEnd(11)}║\n` +
     `╠══════════════════════════╣\n` +
     `║  📲 M-Pesa Till Number   ║\n` +
     `║                          ║\n` +
@@ -365,16 +389,20 @@ async function stkPush(phone, amount, chatId) {
     );
 
     if (res.data.ResponseCode === "0") {
-      // FIX: store full context so callback works even if userSelections is stale
       const sel = userSelections[chatId] || {};
-      pendingSTK[res.data.CheckoutRequestID] = {
+
+      // FIX 5: Log exactly what is being stored so we can audit plan/pkg in callback
+      const entry = {
         chatId,
-        plan:    sel.plan    || null,
-        pkg:     sel.package || null,
-        price:   sel.price   || amount,
+        plan:     sel.plan     || null,
+        pkg:      sel.package  || null,
+        price:    sel.price    || amount,
         username: sel.username || String(chatId),
       };
-      console.log(`📌 Registered pending STK: ${res.data.CheckoutRequestID} → chatId ${chatId}`);
+      pendingSTK[res.data.CheckoutRequestID] = entry;
+      console.log(`📌 Registered pending STK: ${res.data.CheckoutRequestID} →`, JSON.stringify(entry));
+    } else {
+      console.warn(`⚠️ STK push non-zero ResponseCode: ${res.data.ResponseCode} — ${res.data.ResponseDescription}`);
     }
     return res.data;
   } catch (err) {
@@ -391,7 +419,6 @@ app.post("/mpesa/callback", (req, res) => {
   // Always respond immediately to Safaricom
   res.status(200).json({ ResultCode: 0, ResultDesc: "Accepted" });
 
-  // FIX: log raw payload so you can debug in server logs
   console.log("📩 M-PESA CALLBACK RECEIVED:", JSON.stringify(req.body, null, 2));
 
   try {
@@ -399,11 +426,11 @@ app.post("/mpesa/callback", (req, res) => {
     const checkId = body?.CheckoutRequestID;
     const code    = body?.ResultCode;
 
-    // FIX: look up full context object, not just chatId
+    console.log(`🔍 Callback: CheckoutRequestID=${checkId}, ResultCode=${code}`);
+
     const pending = pendingSTK[checkId];
 
     if (!pending) {
-      // FIX: was silently returning before — now logs + notifies admins
       console.warn(`⚠️ Unknown CheckoutRequestID: ${checkId}`);
       notifyAdmins(
         `⚠️ *Unknown STK Callback*\n\n` +
@@ -417,6 +444,7 @@ app.post("/mpesa/callback", (req, res) => {
 
     delete pendingSTK[checkId];
     const { chatId, plan, pkg, price, username } = pending;
+    console.log(`✅ Matched pending STK: chatId=${chatId}, plan=${plan}, pkg=${pkg}`);
 
     if (code === 0) {
       const meta      = body.CallbackMetadata?.Item || [];
@@ -425,22 +453,27 @@ app.post("/mpesa/callback", (req, res) => {
       const mpesaCode = get("MpesaReceiptNumber");
       const phone     = get("PhoneNumber");
 
-      // Update userSelections
+      console.log(`💰 Payment confirmed: amount=${amount}, ref=${mpesaCode}, phone=${phone}`);
+
+      // Update userSelections — restore from pendingSTK context if session was lost
       const sel  = userSelections[chatId] || {};
       sel.paidAt = new Date().toISOString();
       sel.stkRef = mpesaCode;
       sel.phone  = phone;
-      // Restore plan/package from pending context if userSelections was wiped
       if (!sel.plan    && plan) sel.plan    = plan;
       if (!sel.package && pkg)  sel.package = pkg;
       userSelections[chatId] = sel;
       clearReminders(chatId);
 
+      // FIX 6: Resolve final plan label with fallback BEFORE passing to grantAccess
+      const finalPlan = sel.plan || plan || "1 Month";
+      console.log(`🎯 Final plan for grantAccess: "${finalPlan}"`);
+
       recordPayment({
         chatId,
         username: sel.username || username,
         pkg:      sel.package  || pkg  || "N/A",
-        plan:     sel.plan     || plan || "1 Month",
+        plan:     finalPlan,
         amount,
         ref:      mpesaCode,
         phone
@@ -448,17 +481,17 @@ app.post("/mpesa/callback", (req, res) => {
 
       grantAccess(
         chatId,
-        sel.plan || plan || "1 Month",
+        finalPlan,
         `✅ Ksh *${amount}* received via M-Pesa\n🧾 Ref: \`${mpesaCode}\``
       );
 
       notifyAdmins(
         `💰 *PAYMENT CONFIRMED (STK)*\n\n` +
-        `👤 \`${chatId}\`\n📦 ${sel.package || pkg || "N/A"} — ${sel.plan || plan || "N/A"}\n` +
+        `👤 \`${chatId}\`\n📦 ${sel.package || pkg || "N/A"} — ${finalPlan}\n` +
         `💰 Ksh ${amount} | 🧾 \`${mpesaCode}\`\n📱 ${phone}\n\n➡️ Access sent automatically.`
       );
     } else {
-      console.log(`❌ STK failed for ${chatId} | ResultCode: ${code}`);
+      console.log(`❌ STK failed for ${chatId} | ResultCode: ${code} | Desc: ${body?.ResultDesc}`);
       bot.sendMessage(chatId,
         `⚠️ *Payment prompt was not completed.*\n\nThis can happen if the prompt timed out, wrong PIN was entered, or network was unstable.\n\nYou can still pay manually 👇`,
         {
@@ -474,7 +507,7 @@ app.post("/mpesa/callback", (req, res) => {
       ).catch(() => {});
     }
   } catch (err) {
-    console.error("STK Callback error:", err.message);
+    console.error("STK Callback error:", err.message, err.stack);
     notifyAdmins(`🚨 *STK Callback crashed*\n\`${err.message}\``);
   }
 });
@@ -513,7 +546,6 @@ async function startUsdtPoller(chatId, expectedUsdt) {
       const txns = res.data?.data || [];
 
       for (const tx of txns) {
-        // FIX: trim both sides before comparing to avoid whitespace issues
         const txTo = (tx.to || "").trim().toLowerCase();
         if (txTo !== USDT_WALLET.trim().toLowerCase()) continue;
 
@@ -527,19 +559,22 @@ async function startUsdtPoller(chatId, expectedUsdt) {
           sel.stkRef = tx.transaction_id;
           userSelections[chatId] = sel;
 
+          // FIX 7: Same plan fallback applied to USDT path
+          const finalPlan = sel.plan || "1 Month";
+
           recordPayment({
             chatId, username: sel.username || String(chatId),
-            pkg: sel.package, plan: sel.plan,
+            pkg: sel.package, plan: finalPlan,
             amount: received, ref: tx.transaction_id, phone: "USDT", currency: "USDT"
           });
 
-          grantAccess(chatId, sel.plan || "1 Month",
+          grantAccess(chatId, finalPlan,
             `✅ *$${received} USDT* received\n🧾 TxID: \`${tx.transaction_id.substring(0, 20)}...\``
           );
 
           notifyAdmins(
             `💵 *USDT PAYMENT CONFIRMED*\n\n` +
-            `👤 \`${chatId}\`\n📦 ${sel.package || "N/A"} — ${sel.plan || "N/A"}\n` +
+            `👤 \`${chatId}\`\n📦 ${sel.package || "N/A"} — ${finalPlan}\n` +
             `💰 $${received} USDT\n🧾 \`${tx.transaction_id}\`\n\n➡️ Access sent automatically.`
           );
           return;
@@ -656,7 +691,7 @@ bot.onText(/\/send (\d+) ([\S]+)/, (msg, match) => {
         }, (days - 1) * 86400 * 1000);
       }
       timers.kickTimer = setTimeout(async () => {
-        try { await bot.banChatMember(CHANNEL_ID, targetChatId); await bot.unbanChatMember(CHANNEL_ID, targetChatId); } catch (e) {}
+        try { await bot.banChatMember(CHANNEL_ID, Number(targetChatId)); await bot.unbanChatMember(CHANNEL_ID, Number(targetChatId)); } catch (e) {}
         bot.sendMessage(targetChatId,
           `👋 *Your access has ended.*\n\nYour *${sel.plan}* plan expired. Hope you enjoyed it! 🙏\n\nCome back anytime 😊`,
           { parse_mode: "Markdown", reply_markup: { inline_keyboard: [[{ text: "🔄 Re-subscribe", callback_data: "change_package" }]] } }
@@ -671,7 +706,7 @@ bot.onText(/\/send (\d+) ([\S]+)/, (msg, match) => {
 // ─── ADMIN: /grant <chatId> — auto-generate and send invite link ──────────────
 bot.onText(/\/grant (\d+)/, async (msg, match) => {
   if (!ADMIN_IDS.includes(String(msg.chat.id))) return bot.sendMessage(msg.chat.id, "⛔ Not authorized.");
-  const targetChatId = match[1];
+  const targetChatId = Number(match[1]);   // FIX 8: ensure it's a number
   const sel          = userSelections[targetChatId] || {};
   const plan         = sel.plan || "1 Month";
 
@@ -769,15 +804,16 @@ bot.onText(/\/ledger/, (msg) => {
 
 bot.onText(/\/kick (\d+)/, async (msg, match) => {
   if (!ADMIN_IDS.includes(String(msg.chat.id))) return bot.sendMessage(msg.chat.id, "⛔ Not authorized.");
+  const targetId = Number(match[1]);  // FIX 9: number for ban/unban
   try {
-    await bot.banChatMember(CHANNEL_ID, match[1]);
-    await bot.unbanChatMember(CHANNEL_ID, match[1]);
-    clearSubTimers(match[1]);
-    bot.sendMessage(match[1],
+    await bot.banChatMember(CHANNEL_ID, targetId);
+    await bot.unbanChatMember(CHANNEL_ID, targetId);
+    clearSubTimers(String(targetId));
+    bot.sendMessage(targetId,
       `👋 *Your access has been removed.*\n\nWe hope you enjoyed your time! 🙏\n\nReady to come back? Tap below 😊`,
       { parse_mode: "Markdown", reply_markup: { inline_keyboard: [[{ text: "🔄 Re-subscribe", callback_data: "change_package" }]] } }
     ).catch(() => {});
-    bot.sendMessage(msg.chat.id, `✅ User \`${match[1]}\` removed.`, { parse_mode: "Markdown" });
+    bot.sendMessage(msg.chat.id, `✅ User \`${targetId}\` removed.`, { parse_mode: "Markdown" });
   } catch (err) {
     bot.sendMessage(msg.chat.id, `❌ Failed: ${err.message}`);
   }
@@ -831,7 +867,6 @@ bot.on("message", async (msg) => {
     try {
       const result = await stkPush(phone, sel.price, chatId);
       if (result.ResponseCode === "0") {
-        // FIX: show "I've Paid" fallback button alongside confirmation message
         await bot.sendMessage(chatId,
           `✅ *Payment prompt sent!*\n\nEnter your M-Pesa PIN to complete. Access will be sent automatically once confirmed. 🔐\n\n_If you've already paid but don't receive access within 2 minutes, tap the button below._`,
           {
@@ -1180,4 +1215,5 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`📡 M-Pesa callback URL: ${CALLBACK_URL || "⚠️ NOT SET"}`);
+  console.log(`📺 Channel ID: ${CHANNEL_ID}`);
 });
