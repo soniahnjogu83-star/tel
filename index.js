@@ -3,6 +3,8 @@ require("dotenv").config();
 const express = require("express");
 const axios   = require("axios");
 const moment  = require("moment");
+const fs      = require("fs");
+const path    = require("path");
 const TelegramBot = require("node-telegram-bot-api");
 
 // ─── APP SETUP ───────────────────────────────────────────────────────────────
@@ -98,6 +100,41 @@ const PLAN_DAYS = {
 };
 
 const subTimers = {};
+
+// ─── SUBSCRIPTION PERSISTENCE ────────────────────────────────────────────────
+// Saves expiry dates to disk so kick timers survive server restarts.
+const SUBS_FILE = path.join(__dirname, "subscriptions.json");
+
+function loadSubs() {
+  try {
+    if (fs.existsSync(SUBS_FILE)) {
+      return JSON.parse(fs.readFileSync(SUBS_FILE, "utf8"));
+    }
+  } catch (e) {
+    console.error("⚠️ Could not load subscriptions.json:", e.message);
+  }
+  return {};
+}
+
+function saveSubs(data) {
+  try {
+    fs.writeFileSync(SUBS_FILE, JSON.stringify(data, null, 2));
+  } catch (e) {
+    console.error("⚠️ Could not save subscriptions.json:", e.message);
+  }
+}
+
+function saveSubEntry(chatId, planLabel, expiresAt) {
+  const data = loadSubs();
+  data[cid(chatId)] = { planLabel, expiresAt };
+  saveSubs(data);
+}
+
+function removeSubEntry(chatId) {
+  const data = loadSubs();
+  delete data[cid(chatId)];
+  saveSubs(data);
+}
 
 // ─── HELPERS: normalize chatId to string always ───────────────────────────────
 const cid = (id) => String(id);
@@ -205,9 +242,11 @@ async function grantAccess(rawChatId, planLabel, paymentSummary) {
         }
       ).catch(() => {});
       delete subTimers[chatId];
+      removeSubEntry(chatId);
     }, days * 86400 * 1000);
 
     subTimers[chatId] = timers;
+    saveSubEntry(chatId, resolvedLabel, timers.expiresAt);
     console.log(`✅ Access fully set up for ${chatId} | ${resolvedLabel} | ${days}d`);
 
   } catch (err) {
@@ -243,6 +282,7 @@ function clearSubTimers(chatId) {
     clearTimeout(subTimers[id].warnTimer);
     clearTimeout(subTimers[id].kickTimer);
     delete subTimers[id];
+    removeSubEntry(id);
   }
 }
 
@@ -764,11 +804,39 @@ bot.onText(/\/send (\d+) ([\S]+)/, (msg, match) => {
   }).catch((err) => bot.sendMessage(cid(msg.chat.id), `❌ Failed: ${err.message}`));
 });
 
-bot.onText(/\/grant (\d+)/, async (msg, match) => {
+// /grant <chatId> <plan>  e.g. /grant 8399543359 1 Month
+// Plan can be: 1 Day | 1 Week | 2 Weeks | 1 Month | 6 Months | 1 Year
+bot.onText(/\/grant (\d+)(?: (.+))?/, async (msg, match) => {
   if (!ADMIN_IDS.includes(cid(msg.chat.id))) return bot.sendMessage(cid(msg.chat.id), "⛔ Not authorized.");
-  const targetId = cid(match[1]);
-  const sel      = userSelections[targetId] || {};
-  const plan     = sel.plan || "1 Month";
+  const targetId  = cid(match[1]);
+  const planArg   = (match[2] || "").trim();
+  const sel       = userSelections[targetId] || {};
+
+  // Resolve plan: from command arg → user session → default
+  const plan = PLAN_DAYS[planArg] !== undefined ? planArg
+             : PLAN_DAYS[sel.plan] !== undefined ? sel.plan
+             : null;
+
+  // If no valid plan found, show a picker so admin can choose
+  if (!plan) {
+    return bot.sendMessage(cid(msg.chat.id),
+      `📋 *Grant access to* \`${targetId}\`\n\nChoose a plan:`,
+      {
+        parse_mode: "Markdown",
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: "1 Day",    callback_data: `admin_grant_${targetId}_1 Day` }],
+            [{ text: "1 Week",   callback_data: `admin_grant_${targetId}_1 Week` }],
+            [{ text: "2 Weeks",  callback_data: `admin_grant_${targetId}_2 Weeks` }],
+            [{ text: "1 Month",  callback_data: `admin_grant_${targetId}_1 Month` }],
+            [{ text: "6 Months", callback_data: `admin_grant_${targetId}_6 Months` }],
+            [{ text: "1 Year",   callback_data: `admin_grant_${targetId}_1 Year` }],
+          ]
+        }
+      }
+    );
+  }
+
   try {
     await grantAccess(targetId, plan, `✅ Access manually granted by admin\n📦 Plan: *${plan}*`);
     bot.sendMessage(cid(msg.chat.id), `✅ Access granted to \`${targetId}\` for plan *${plan}*`, { parse_mode: "Markdown" });
@@ -1425,12 +1493,93 @@ bot.on("callback_query", async (query) => {
   }
 });
 
+// ─── RESTORE SUBSCRIPTIONS ON STARTUP ───────────────────────────────────────
+function restoreSubTimers() {
+  const data = loadSubs();
+  const entries = Object.entries(data);
+  if (!entries.length) return console.log("📂 No saved subscriptions to restore.");
+
+  let restored = 0, expired = 0;
+  const now = Date.now();
+
+  entries.forEach(([chatId, { planLabel, expiresAt }]) => {
+    const msLeft = expiresAt - now;
+
+    if (msLeft <= 0) {
+      // Already expired while server was down — kick now
+      console.log(`⏰ Sub expired while offline: ${chatId} — kicking now`);
+      bot.banChatMember(CHANNEL_ID, Number(chatId))
+        .then(() => bot.unbanChatMember(CHANNEL_ID, Number(chatId)))
+        .catch(() => {});
+      bot.sendMessage(chatId,
+        `👋 *Your access has ended.*
+
+Your *${planLabel}* plan expired while we were briefly offline. We hope you enjoyed your time! 🙏
+
+Ready to come back? Tap below 😊`,
+        { parse_mode: "Markdown", reply_markup: { inline_keyboard: [[{ text: "🔄 Re-subscribe", callback_data: "change_package" }]] } }
+      ).catch(() => {});
+      removeSubEntry(chatId);
+      expired++;
+      return;
+    }
+
+    // Still active — re-arm timers
+    const timers = { expiresAt };
+    const days = Math.ceil(msLeft / 86400000);
+
+    if (msLeft > 86400000) {
+      // Warn 24h before expiry
+      const warnMs = msLeft - 86400000;
+      timers.warnTimer = setTimeout(() => {
+        bot.sendMessage(chatId,
+          `⏰ *Heads up!*
+
+Your *${planLabel}* access expires in *24 hours*.
+
+Renew now to stay connected 😊`,
+          { parse_mode: "Markdown", reply_markup: { inline_keyboard: [[{ text: "🔄 Renew My Access", callback_data: "change_package" }]] } }
+        ).catch(() => {});
+      }, warnMs);
+    }
+
+    timers.kickTimer = setTimeout(async () => {
+      try {
+        await bot.banChatMember(CHANNEL_ID, Number(chatId));
+        await bot.unbanChatMember(CHANNEL_ID, Number(chatId));
+        console.log(`🚪 User ${chatId} removed after plan expiry (restored timer)`);
+      } catch (e) {
+        console.error("Kick error:", e.message);
+      }
+      bot.sendMessage(chatId,
+        `👋 *Your access has ended.*
+
+Your *${planLabel}* plan has expired. We hope you enjoyed your time with us! 🙏
+
+Whenever you're ready to come back, we'll be here 😊`,
+        { parse_mode: "Markdown", reply_markup: { inline_keyboard: [[{ text: "🔄 Re-subscribe", callback_data: "change_package" }]] } }
+      ).catch(() => {});
+      delete subTimers[chatId];
+      removeSubEntry(chatId);
+    }, msLeft);
+
+    subTimers[chatId] = timers;
+    restored++;
+    console.log(`🔁 Restored timer for ${chatId} | ${planLabel} | ${Math.round(msLeft/3600000)}h left`);
+  });
+
+  console.log(`✅ Subscriptions restored: ${restored} active, ${expired} expired & kicked`);
+}
+
 // ─── EXPRESS SERVER ──────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`📡 M-Pesa callback URL: ${CALLBACK_URL || "⚠️ NOT SET"}`);
   console.log(`📺 Channel ID: ${CHANNEL_ID}`);
+
+  // Restore kick timers from disk after bot is ready
+  setTimeout(restoreSubTimers, 3000);
 
   // ─── KEEP ALIVE (prevents Render free tier from sleeping) ────────────────
   if (RENDER_URL) {
