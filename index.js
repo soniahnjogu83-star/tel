@@ -28,28 +28,38 @@ const RENDER_URL      = process.env.RENDER_EXTERNAL_URL
 // ─── CHANNEL_ID ──────────────────────────────────────────────────────────────
 const CHANNEL_ID = -1001567081082;
 
-// ─── BOT: LONG POLLING ───────────────────────────────────────────────────────
-// Long polling is the most reliable mode on Render free tier.
-// It never gets a 409 Conflict, survives redeploys automatically,
-// and requires zero webhook registration or HTTPS setup.
-const bot = new TelegramBot(BOT_TOKEN, {
-  polling: {
-    interval: 1000,        // check every second
-    autoStart: true,
-    params: { timeout: 10 } // long-poll timeout in seconds
+// ─── BOT: LONG POLLING (with webhook cleanup) ────────────────────────────────
+// We always delete any registered webhook first — this permanently kills the
+// 409 Conflict that happens when a previous deploy had webhook mode active.
+// After deletion we start long polling, which is the most reliable mode on
+// Render: no HTTPS setup, no registration step, auto-reconnects on redeploy.
+
+const bot = new TelegramBot(BOT_TOKEN, { polling: false }); // start paused
+
+// Delete webhook then start polling — runs once on every deploy
+(async () => {
+  try {
+    await bot.deleteWebHook({ drop_pending_updates: true });
+    console.log("✅ Webhook deleted (any old webhook is now cleared).");
+  } catch (err) {
+    console.warn("⚠️  Could not delete webhook (may not have existed):", err.message);
   }
-});
+
+  // Small delay to let Telegram process the deletion before we start polling
+  await new Promise((r) => setTimeout(r, 1500));
+
+  bot.startPolling({ interval: 1000, params: { timeout: 10 } });
+  console.log("✅ Bot started in long-polling mode.");
+})();
 
 bot.on("polling_error", (err) => {
-  // 409 = another instance is polling; safe to ignore on first deploy
   if (err.code === "ETELEGRAM" && err.message.includes("409")) {
-    console.warn("⚠️  Polling conflict (409) — another instance may still be shutting down. Retrying...");
+    // Should no longer happen after webhook deletion above, but log if it does
+    console.warn("⚠️  Polling 409 — waiting for Telegram to settle...");
   } else {
     console.error("❌ Polling error:", err.message);
   }
 });
-
-console.log("✅ Bot started in long-polling mode.");
 
 // ─── EARLY ENV VALIDATION ────────────────────────────────────────────────────
 (function validateEnv() {
@@ -438,11 +448,12 @@ async function stkPush(phone, amount, chatId) {
     );
 
     if (res.data.ResponseCode === "0") {
-      const sel   = userSelections[id] || {};
+      const sel = userSelections[id] || {};
+      console.log(`🔎 stkPush lookup userSelections[${id}]:`, JSON.stringify(sel));
       const entry = {
         chatId:   id,
         plan:     sel.plan    || null,
-        pkg:      sel.package || null,
+        pkg:      sel.package || sel.pkg || null,   // belt-and-suspenders
         price:    sel.price   || amount,
         username: sel.username || id,
       };
