@@ -12,8 +12,6 @@ app.use(express.json());
 // ─── HEALTH CHECK (keep-alive target + uptime monitors) ──────────────────────
 app.get("/", (req, res) => res.status(200).send("OK"));
 
-const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true });
-
 // ─── CONFIG ──────────────────────────────────────────────────────────────────
 const TILL_NUMBER     = "4902476";
 const TILL_NAME       = "ALJAKI Enterprise";
@@ -23,20 +21,37 @@ const PASSKEY         = process.env.PASSKEY;
 const CONSUMER_KEY    = process.env.CONSUMER_KEY;
 const CONSUMER_SECRET = process.env.CONSUMER_SECRET;
 const CALLBACK_URL    = process.env.CALLBACK_URL || "";
+const BOT_TOKEN       = process.env.BOT_TOKEN;
+const RENDER_URL      = process.env.RENDER_EXTERNAL_URL
+  || (CALLBACK_URL ? CALLBACK_URL.replace("/mpesa/callback", "") : null);
 
-// ─── FIX 1: CHANNEL_ID as a NUMBER (not string) ──────────────────────────────
-// String channel IDs cause createChatInviteLink / banChatMember to fail silently
+// ─── CHANNEL_ID as NUMBER (string causes silent failures) ────────────────────
 const CHANNEL_ID = -1001567081082;
+
+// ─── BOT: WEBHOOK MODE ───────────────────────────────────────────────────────
+// Webhook = Telegram pushes updates to our server. Much more reliable on Render
+// than polling, and eliminates the 409 Conflict error on redeploy entirely.
+const bot = new TelegramBot(BOT_TOKEN, { webHook: { port: process.env.PORT || 3000 } });
+
+if (RENDER_URL) {
+  const webhookUrl = `${RENDER_URL}/bot${BOT_TOKEN}`;
+  bot.setWebHook(webhookUrl)
+    .then(() => console.log(`✅ Webhook set: ${webhookUrl}`))
+    .catch((err) => console.error("❌ Webhook set failed:", err.message));
+} else {
+  console.warn("⚠️ RENDER_EXTERNAL_URL not set — webhook not registered.");
+}
 
 // ─── EARLY ENV VALIDATION ────────────────────────────────────────────────────
 (function validateEnv() {
   const required = {
-    BOT_TOKEN:       process.env.BOT_TOKEN,
-    SHORTCODE:       process.env.SHORTCODE,
-    PASSKEY:         process.env.PASSKEY,
-    CONSUMER_KEY:    process.env.CONSUMER_KEY,
-    CONSUMER_SECRET: process.env.CONSUMER_SECRET,
-    CALLBACK_URL:    process.env.CALLBACK_URL,
+    BOT_TOKEN:           BOT_TOKEN,
+    SHORTCODE:           process.env.SHORTCODE,
+    PASSKEY:             process.env.PASSKEY,
+    CONSUMER_KEY:        process.env.CONSUMER_KEY,
+    CONSUMER_SECRET:     process.env.CONSUMER_SECRET,
+    CALLBACK_URL:        process.env.CALLBACK_URL,
+    RENDER_EXTERNAL_URL: process.env.RENDER_EXTERNAL_URL,
   };
   const missing = Object.entries(required).filter(([, v]) => !v).map(([k]) => k);
   if (missing.length > 0) {
@@ -44,7 +59,7 @@ const CHANNEL_ID = -1001567081082;
       `🚨 *STARTUP WARNING*\n\n` +
       `Missing environment variables:\n` +
       missing.map((k) => `• \`${k}\``).join("\n") +
-      `\n\n⚠️ Daraja STK Push will *not work* until these are set.`;
+      `\n\n⚠️ Bot and/or STK Push will not work until these are set.`;
     console.error("❌ Missing env vars:", missing.join(", "));
     setTimeout(() => {
       ADMIN_IDS.forEach((id) => bot.sendMessage(id, msg, { parse_mode: "Markdown" }).catch(() => {}));
@@ -76,7 +91,6 @@ async function sendTyping(chatId, durationMs = 1500) {
 
 // ─── GRANT ACCESS ────────────────────────────────────────────────────────────
 async function grantAccess(chatId, planLabel, paymentSummary) {
-  // FIX 2: Validate and resolve planLabel before doing anything
   console.log(`🔍 grantAccess called: chatId=${chatId}, planLabel="${planLabel}"`);
 
   const resolvedLabel = PLAN_DAYS[planLabel] !== undefined ? planLabel : "1 Month";
@@ -87,20 +101,15 @@ async function grantAccess(chatId, planLabel, paymentSummary) {
   const days = PLAN_DAYS[resolvedLabel];
   console.log(`📅 Days resolved: ${days} for plan "${resolvedLabel}"`);
 
-  // FIX 3: Validate days is a real number before using it
   if (!days || isNaN(days)) {
     console.error(`❌ grantAccess: could not resolve days for plan "${planLabel}"`);
     notifyAdmins(
-      `⚠️ *grantAccess FAILED*\n\n` +
-      `ChatID: \`${chatId}\`\n` +
-      `Bad planLabel: \`${planLabel}\`\n\n` +
-      `Manual fix:\n\`/grant ${chatId}\``
+      `⚠️ *grantAccess FAILED*\n\nChatID: \`${chatId}\`\nBad planLabel: \`${planLabel}\`\n\nManual fix:\n\`/grant ${chatId}\``
     );
     return;
   }
 
   try {
-    // FIX 4: expire_date must be a valid integer (unix seconds)
     const expireDate = Math.floor(Date.now() / 1000) + days * 86400;
     console.log(`🔗 Creating invite link: chatId=${chatId}, days=${days}, expireDate=${expireDate}, CHANNEL_ID=${CHANNEL_ID}`);
 
@@ -164,15 +173,28 @@ async function grantAccess(chatId, planLabel, paymentSummary) {
 
   } catch (err) {
     console.error("❌ grantAccess error:", err.message, err.stack);
+
+    // ── Notify admins with one-tap approve button ─────────────────────────
     notifyAdmins(
       `⚠️ *Auto-invite FAILED for* \`${chatId}\`\n\n` +
       `Plan: *${resolvedLabel}* (${days} days)\n` +
       `Error: \`${err.message}\`\n\n` +
-      `*Fix:* Make sure the bot is a channel admin with "Invite Users via Link" permission.\n\n` +
-      `*Manual fallback:*\n\`/grant ${chatId}\``
+      `Tap below to grant access manually 👇`,
+      {
+        reply_markup: {
+          inline_keyboard: [[
+            { text: `✅ Grant Access to ${chatId}`, callback_data: `admin_grant_${chatId}_${resolvedLabel}` }
+          ]]
+        }
+      }
     );
+
+    // ── Apologise sincerely to user ───────────────────────────────────────
     bot.sendMessage(chatId,
-      `⏳ *Almost there!*\n\nYour payment was received ✅\n\nWe're preparing your access link — it will be sent to you shortly. Please wait a moment. 🔐`,
+      `😔 *We're so sorry for the delay!*\n\n` +
+      `Your payment was received successfully ✅ — but we ran into a small technical issue sending your access link automatically.\n\n` +
+      `*Please don't worry — you will not lose your access.* Our team has been notified and will send your link manually within a few minutes. 🙏\n\n` +
+      `We sincerely apologise for the inconvenience. Thank you so much for your patience! 💛`,
       { parse_mode: "Markdown" }
     ).catch(() => {});
   }
@@ -193,14 +215,12 @@ const pendingUSDT  = {};
 
 // ─── PLANS ───────────────────────────────────────────────────────────────────
 const PLANS = {
-  // Naughty Premium Leaks
   naughty_1day:    { label: "1 Day",    price: 40 },
   naughty_1week:   { label: "1 Week",   price: 170 },
   naughty_2weeks:  { label: "2 Weeks",  price: 270 },
   naughty_1month:  { label: "1 Month",  price: 450 },
   naughty_6months: { label: "6 Months", price: 2500 },
   naughty_1year:   { label: "1 Year",   price: 6200 },
-  // Naughty Explicit
   premium_1day:    { label: "1 Day",    price: 50 },
   premium_1week:   { label: "1 Week",   price: 220 },
   premium_2weeks:  { label: "2 Weeks",  price: 400 },
@@ -218,9 +238,11 @@ const USDT_PLANS = [
 ];
 
 // ─── STORE ───────────────────────────────────────────────────────────────────
-const userSelections = {};
-const pendingSTK     = {};  // checkoutRequestID -> { chatId, plan, pkg, amount }
-const reminderTimers = {};
+const userSelections  = {};
+const pendingSTK      = {};
+const reminderTimers  = {};
+// awaitingReceipt[chatId] = { plan, pkg, price } when bot expects M-Pesa code
+const awaitingReceipt = {};
 
 // ─── PAYMENT LEDGER ──────────────────────────────────────────────────────────
 const paymentLedger = [];
@@ -358,7 +380,7 @@ async function getMpesaToken() {
   }
 }
 
-// ─── M-PESA: STK PUSH ─────────────────────────────────────────────────────────
+// ─── M-PESA: STK PUSH ────────────────────────────────────────────────────────
 async function stkPush(phone, amount, chatId) {
   try {
     const token     = await getMpesaToken();
@@ -392,14 +414,12 @@ async function stkPush(phone, amount, chatId) {
     );
 
     if (res.data.ResponseCode === "0") {
-      const sel = userSelections[chatId] || {};
-
-      // FIX 5: Log exactly what is being stored so we can audit plan/pkg in callback
+      const sel   = userSelections[chatId] || {};
       const entry = {
         chatId,
-        plan:     sel.plan     || null,
-        pkg:      sel.package  || null,
-        price:    sel.price    || amount,
+        plan:     sel.plan    || null,
+        pkg:      sel.package || null,
+        price:    sel.price   || amount,
         username: sel.username || String(chatId),
       };
       pendingSTK[res.data.CheckoutRequestID] = entry;
@@ -417,11 +437,9 @@ async function stkPush(phone, amount, chatId) {
   }
 }
 
-// ─── M-PESA CALLBACK ──────────────────────────────────────────────────────────
+// ─── M-PESA CALLBACK ─────────────────────────────────────────────────────────
 app.post("/mpesa/callback", (req, res) => {
-  // Always respond immediately to Safaricom
   res.status(200).json({ ResultCode: 0, ResultDesc: "Accepted" });
-
   console.log("📩 M-PESA CALLBACK RECEIVED:", JSON.stringify(req.body, null, 2));
 
   try {
@@ -437,10 +455,8 @@ app.post("/mpesa/callback", (req, res) => {
       console.warn(`⚠️ Unknown CheckoutRequestID: ${checkId}`);
       notifyAdmins(
         `⚠️ *Unknown STK Callback*\n\n` +
-        `CheckoutRequestID: \`${checkId}\`\n` +
-        `ResultCode: ${code}\n\n` +
-        `_This usually means the server restarted after the STK push was sent._\n\n` +
-        `If a user paid, use:\n\`/grant <chatId>\``
+        `CheckoutRequestID: \`${checkId}\`\nResultCode: ${code}\n\n` +
+        `_Server may have restarted after STK push._\n\nIf a user paid:\n\`/grant <chatId>\``
       );
       return;
     }
@@ -458,7 +474,6 @@ app.post("/mpesa/callback", (req, res) => {
 
       console.log(`💰 Payment confirmed: amount=${amount}, ref=${mpesaCode}, phone=${phone}`);
 
-      // Update userSelections — restore from pendingSTK context if session was lost
       const sel  = userSelections[chatId] || {};
       sel.paidAt = new Date().toISOString();
       sel.stkRef = mpesaCode;
@@ -468,7 +483,6 @@ app.post("/mpesa/callback", (req, res) => {
       userSelections[chatId] = sel;
       clearReminders(chatId);
 
-      // FIX 6: Resolve final plan label with fallback BEFORE passing to grantAccess
       const finalPlan = sel.plan || plan || "1 Month";
       console.log(`🎯 Final plan for grantAccess: "${finalPlan}"`);
 
@@ -493,10 +507,22 @@ app.post("/mpesa/callback", (req, res) => {
         `👤 \`${chatId}\`\n📦 ${sel.package || pkg || "N/A"} — ${finalPlan}\n` +
         `💰 Ksh ${amount} | 🧾 \`${mpesaCode}\`\n📱 ${phone}\n\n➡️ Access sent automatically.`
       );
+
     } else {
       console.log(`❌ STK failed for ${chatId} | ResultCode: ${code} | Desc: ${body?.ResultDesc}`);
+
+      // ── Ask user for M-Pesa receipt code as fallback ──────────────────────
+      awaitingReceipt[chatId] = {
+        plan:  plan || (userSelections[chatId] || {}).plan || "1 Month",
+        pkg:   pkg  || (userSelections[chatId] || {}).package || "N/A",
+        price: price || (userSelections[chatId] || {}).price || 0,
+      };
+
       bot.sendMessage(chatId,
-        `⚠️ *Payment prompt was not completed.*\n\nThis can happen if the prompt timed out, wrong PIN was entered, or network was unstable.\n\nYou can still pay manually 👇`,
+        `⚠️ *Payment prompt was not completed.*\n\n` +
+        `This can happen if:\n• The prompt timed out\n• Wrong PIN was entered\n• Network was unstable\n\n` +
+        `📋 *If your M-Pesa was actually deducted*, please type your *M-Pesa confirmation code* from your SMS (e.g. \`RCX4B2K9QP\`) and our team will verify and send your access link. 🔍\n\n` +
+        `Otherwise, choose an option below 👇`,
         {
           parse_mode: "Markdown",
           reply_markup: {
@@ -562,7 +588,6 @@ async function startUsdtPoller(chatId, expectedUsdt) {
           sel.stkRef = tx.transaction_id;
           userSelections[chatId] = sel;
 
-          // FIX 7: Same plan fallback applied to USDT path
           const finalPlan = sel.plan || "1 Month";
 
           recordPayment({
@@ -617,19 +642,16 @@ bot.onText(/\/start/, async (msg) => {
   );
 });
 
-// ─── /myid ────────────────────────────────────────────────────────────────────
 bot.onText(/\/myid/, (msg) => {
   bot.sendMessage(msg.chat.id, `🆔 Your Chat ID: \`${msg.chat.id}\``, { parse_mode: "Markdown" });
 });
 
-// ─── /testadmin ───────────────────────────────────────────────────────────────
 bot.onText(/\/testadmin/, (msg) => {
   if (!ADMIN_IDS.includes(String(msg.chat.id))) return bot.sendMessage(msg.chat.id, "⛔ Not authorized.");
   notifyAdmins(`🧪 *Test Notification*\nTriggered by: \`${msg.chat.id}\``);
   bot.sendMessage(msg.chat.id, "✅ Test sent to all admins.");
 });
 
-// ─── /testlink — verify bot can create invite links ──────────────────────────
 bot.onText(/\/testlink/, async (msg) => {
   if (!ADMIN_IDS.includes(String(msg.chat.id))) return bot.sendMessage(msg.chat.id, "⛔ Not authorized.");
   try {
@@ -645,18 +667,13 @@ bot.onText(/\/testlink/, async (msg) => {
   } catch (err) {
     bot.sendMessage(msg.chat.id,
       `❌ *Cannot create invite links*\n\nError: \`${err.message}\`\n\n` +
-      `*How to fix:*\n` +
-      `1. Open your Telegram channel\n` +
-      `2. Go to *Administrators*\n` +
-      `3. Add the bot as an admin\n` +
-      `4. Enable the *"Invite Users via Link"* permission\n` +
-      `5. Run /testlink again to confirm`,
+      `*How to fix:*\n1. Open your Telegram channel\n2. Go to *Administrators*\n` +
+      `3. Add the bot as an admin\n4. Enable *"Invite Users via Link"* permission\n5. Run /testlink again`,
       { parse_mode: "Markdown" }
     );
   }
 });
 
-// ─── /buy ─────────────────────────────────────────────────────────────────────
 bot.onText(/\/buy/, (msg) => {
   const chatId = msg.chat.id;
   const sel    = userSelections[chatId];
@@ -668,13 +685,11 @@ bot.onText(/\/buy/, (msg) => {
   );
 });
 
-// ─── ADMIN: /send <chatId> <link> ─────────────────────────────────────────────
 bot.onText(/\/send (\d+) ([\S]+)/, (msg, match) => {
   if (!ADMIN_IDS.includes(String(msg.chat.id))) return bot.sendMessage(msg.chat.id, "⛔ Not authorized.");
   const targetChatId = match[1];
   const accessLink   = match[2];
   const sel          = userSelections[targetChatId] || {};
-
   bot.sendMessage(targetChatId,
     `🎉 *Access Granted!*\n\nYour payment has been verified ✅\n\nHere's your exclusive link 👇\n${accessLink}\n\n_Welcome to the family. Do not share this link._ 🔐`,
     { parse_mode: "Markdown" }
@@ -706,26 +721,19 @@ bot.onText(/\/send (\d+) ([\S]+)/, (msg, match) => {
   }).catch((err) => bot.sendMessage(msg.chat.id, `❌ Failed: ${err.message}`));
 });
 
-// ─── ADMIN: /grant <chatId> — auto-generate and send invite link ──────────────
 bot.onText(/\/grant (\d+)/, async (msg, match) => {
   if (!ADMIN_IDS.includes(String(msg.chat.id))) return bot.sendMessage(msg.chat.id, "⛔ Not authorized.");
-  const targetChatId = Number(match[1]);   // FIX 8: ensure it's a number
+  const targetChatId = Number(match[1]);
   const sel          = userSelections[targetChatId] || {};
   const plan         = sel.plan || "1 Month";
-
   try {
-    await grantAccess(
-      targetChatId,
-      plan,
-      `✅ Access manually granted by admin\n📦 Plan: *${plan}*`
-    );
+    await grantAccess(targetChatId, plan, `✅ Access manually granted by admin\n📦 Plan: *${plan}*`);
     bot.sendMessage(msg.chat.id, `✅ Access granted to \`${targetChatId}\` for plan *${plan}*`, { parse_mode: "Markdown" });
   } catch (err) {
     bot.sendMessage(msg.chat.id, `❌ Failed to grant access: ${err.message}`);
   }
 });
 
-// ─── ADMIN: /pending — list all pending STK pushes ───────────────────────────
 bot.onText(/\/pending/, (msg) => {
   if (!ADMIN_IDS.includes(String(msg.chat.id))) return bot.sendMessage(msg.chat.id, "⛔ Not authorized.");
   const entries = Object.entries(pendingSTK);
@@ -739,7 +747,6 @@ bot.onText(/\/pending/, (msg) => {
   );
 });
 
-// ─── ADMIN COMMANDS ───────────────────────────────────────────────────────────
 bot.onText(/\/users/, (msg) => {
   if (!ADMIN_IDS.includes(String(msg.chat.id))) return bot.sendMessage(msg.chat.id, "⛔ Not authorized.");
   const entries = Object.entries(userSelections);
@@ -807,7 +814,7 @@ bot.onText(/\/ledger/, (msg) => {
 
 bot.onText(/\/kick (\d+)/, async (msg, match) => {
   if (!ADMIN_IDS.includes(String(msg.chat.id))) return bot.sendMessage(msg.chat.id, "⛔ Not authorized.");
-  const targetId = Number(match[1]);  // FIX 9: number for ban/unban
+  const targetId = Number(match[1]);
   try {
     await bot.banChatMember(CHANNEL_ID, targetId);
     await bot.unbanChatMember(CHANNEL_ID, targetId);
@@ -840,19 +847,67 @@ bot.onText(/\/reply (\d+) (.+)/, (msg, match) => {
     .catch((err) => bot.sendMessage(msg.chat.id, `❌ Failed: ${err.message}`));
 });
 
-// ─── INCOMING TEXT MESSAGES ───────────────────────────────────────────────────
+// ─── INCOMING TEXT MESSAGES ──────────────────────────────────────────────────
 bot.on("message", async (msg) => {
   if (!msg.text || msg.text.startsWith("/")) return;
 
   const chatId = msg.chat.id;
+  const text   = msg.text.trim();
   const sel    = userSelections[chatId];
 
+  // ── Handle M-Pesa receipt code submitted by user ──────────────────────────
+  if (awaitingReceipt[chatId]) {
+    const receiptInfo = awaitingReceipt[chatId];
+    delete awaitingReceipt[chatId];
+
+    const code = text.toUpperCase();
+
+    if (!/^[A-Z0-9]{10}$/.test(code)) {
+      return bot.sendMessage(chatId,
+        `⚠️ That doesn't look like a valid M-Pesa code.\n\nM-Pesa codes are *10 characters* long, e.g. \`RCX4B2K9QP\`.\n\nPlease check your SMS and try again, or tap below for help.`,
+        {
+          parse_mode: "Markdown",
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: "❓ I Need Help", callback_data: "need_help" }],
+              [{ text: "🔄 Try Again",   callback_data: "pay_stk" }]
+            ]
+          }
+        }
+      );
+    }
+
+    // Alert admins with one-tap approve button
+    notifyAdmins(
+      `🔔 *Manual Receipt Submitted*\n\n` +
+      `👤 ChatID: \`${chatId}\`\n` +
+      `📦 ${receiptInfo.pkg || "N/A"} — ${receiptInfo.plan || "N/A"}\n` +
+      `💰 Ksh ${receiptInfo.price || "N/A"}\n` +
+      `🧾 M-Pesa Code: \`${code}\`\n\n` +
+      `Please verify on M-Pesa then tap below to approve 👇`,
+      {
+        reply_markup: {
+          inline_keyboard: [[
+            { text: `✅ Approve & Send Access to ${chatId}`, callback_data: `admin_grant_${chatId}_${receiptInfo.plan || "1 Month"}` }
+          ]]
+        }
+      }
+    );
+
+    return bot.sendMessage(chatId,
+      `✅ *Thank you!*\n\n` +
+      `We've received your M-Pesa code \`${code}\` and our team is verifying it right now. 🔍\n\n` +
+      `You'll receive your access link within a few minutes. We appreciate your patience! 🙏`,
+      { parse_mode: "Markdown" }
+    );
+  }
+
+  // ── Handle phone number for STK push ─────────────────────────────────────
   if (sel && sel.awaitingPhone) {
     sel.awaitingPhone = false;
     userSelections[chatId] = sel;
 
-    const phone   = msg.text.trim();
-    const cleaned = phone.replace(/^\+/, "").replace(/^0/, "254");
+    const cleaned = text.replace(/^\+/, "").replace(/^0/, "254");
 
     if (!/^2547\d{8}$|^2541\d{8}$/.test(cleaned)) {
       return bot.sendMessage(chatId,
@@ -863,15 +918,16 @@ bot.on("message", async (msg) => {
 
     await sendTyping(chatId, 1000);
     await bot.sendMessage(chatId,
-      `⏳ *Sending STK push to ${phone}...*\n\nCheck your phone and enter your M-Pesa PIN. 📲`,
+      `⏳ *Sending STK push to ${text}...*\n\nCheck your phone and enter your M-Pesa PIN. 📲`,
       { parse_mode: "Markdown" }
     );
 
     try {
-      const result = await stkPush(phone, sel.price, chatId);
+      const result = await stkPush(text, sel.price, chatId);
       if (result.ResponseCode === "0") {
         await bot.sendMessage(chatId,
-          `✅ *Payment prompt sent!*\n\nEnter your M-Pesa PIN to complete. Access will be sent automatically once confirmed. 🔐\n\n_If you've already paid but don't receive access within 2 minutes, tap the button below._`,
+          `✅ *Payment prompt sent!*\n\nEnter your M-Pesa PIN to complete. Access will be sent automatically once confirmed. 🔐\n\n` +
+          `_If you've already paid but don't receive access within 2 minutes, tap the button below._`,
           {
             parse_mode: "Markdown",
             reply_markup: {
@@ -929,7 +985,7 @@ bot.on("message", async (msg) => {
   }
 });
 
-// ─── CALLBACK QUERIES ─────────────────────────────────────────────────────────
+// ─── CALLBACK QUERIES ────────────────────────────────────────────────────────
 bot.on("callback_query", async (query) => {
   const chatId = query.message.chat.id;
   const data   = query.data;
@@ -937,7 +993,30 @@ bot.on("callback_query", async (query) => {
   bot.answerCallbackQuery(query.id).catch(() => {});
   await sendTyping(chatId, 600);
 
-  // ── Package selection ──
+  // ── Admin one-tap grant button (sent on auto-invite failure or receipt) ───
+  if (data.startsWith("admin_grant_")) {
+    if (!ADMIN_IDS.includes(String(chatId))) return;
+    // callback_data format: admin_grant_<targetChatId>_<plan words...>
+    // e.g. admin_grant_6954749470_1 Month
+    const withoutPrefix = data.replace("admin_grant_", ""); // "6954749470_1 Month"
+    const underscoreIdx = withoutPrefix.indexOf("_");
+    const targetChatId  = Number(withoutPrefix.substring(0, underscoreIdx));
+    const planLabel     = withoutPrefix.substring(underscoreIdx + 1); // "1 Month"
+
+    try {
+      await grantAccess(
+        targetChatId,
+        planLabel || "1 Month",
+        `✅ Access verified and granted by admin\n📦 Plan: *${planLabel || "1 Month"}*`
+      );
+      bot.sendMessage(chatId, `✅ Access granted to \`${targetChatId}\` for *${planLabel}*`, { parse_mode: "Markdown" });
+    } catch (err) {
+      bot.sendMessage(chatId, `❌ Failed: ${err.message}`);
+    }
+    return;
+  }
+
+  // ── Package selection ─────────────────────────────────────────────────────
   if (data === "package_naughty_premium_leaks") {
     userSelections[chatId] = { package: "Naughty Premium Leaks" };
     return bot.sendMessage(chatId,
@@ -978,7 +1057,6 @@ bot.on("callback_query", async (query) => {
     );
   }
 
-  // ── Back buttons ──
   if (data === "back_to_package_naughty_premium_leaks") {
     userSelections[chatId] = { package: "Naughty Premium Leaks" };
     return bot.sendMessage(chatId, `🔥 *Naughty Premium Leaks* — pick your plan:`, {
@@ -1013,7 +1091,6 @@ bot.on("callback_query", async (query) => {
     });
   }
 
-  // ── Change package ──
   if (data === "change_package") {
     return bot.sendMessage(chatId, `🔄 *Choose a package:*`, {
       parse_mode: "Markdown",
@@ -1026,7 +1103,7 @@ bot.on("callback_query", async (query) => {
     });
   }
 
-  // ── Plan selection (M-Pesa) ──
+  // ── Plan selection ────────────────────────────────────────────────────────
   if (PLANS[data]) {
     const plan = PLANS[data];
     const sel  = userSelections[chatId] || {};
@@ -1037,8 +1114,8 @@ bot.on("callback_query", async (query) => {
     const backTarget = data.startsWith("naughty_") ? "package_naughty_premium_leaks" : "package_naughty_explicit";
     scheduleReminders(chatId);
 
-    const usdtPlan  = USDT_PLANS.find((p) => p.label === plan.label);
-    const keyboard  = [
+    const usdtPlan = USDT_PLANS.find((p) => p.label === plan.label);
+    const keyboard = [
       [{ text: `📲 Pay via STK Push (Recommended)`, callback_data: "pay_stk" }],
       ...(usdtPlan ? [[{ text: `₿ Pay with Crypto  ($${usdtPlan.usdt} USDT)`, callback_data: "pay_usdt" }]] : []),
       [{ text: `⬅️ Change Plan`, callback_data: `back_to_${backTarget}` }]
@@ -1050,7 +1127,6 @@ bot.on("callback_query", async (query) => {
     );
   }
 
-  // ── STK Push: ask for phone ──
   if (data === "pay_stk") {
     const sel = userSelections[chatId];
     if (!sel || !sel.price) return bot.sendMessage(chatId, "⚠️ Please start over with /start.");
@@ -1061,35 +1137,29 @@ bot.on("callback_query", async (query) => {
     );
   }
 
-  // ── USDT: show plan list ──
   if (data === "pay_usdt") {
     const sel = userSelections[chatId];
     if (!sel || !sel.package) return bot.sendMessage(chatId, "⚠️ Please start over with /start.");
-
     const isNaughty = sel.package === "Naughty Premium Leaks";
     const backKey   = isNaughty ? "back_to_package_naughty_premium_leaks" : "back_to_package_naughty_explicit";
-
     return bot.sendMessage(chatId,
-      `₿ *Pay with Crypto — Choose Your Plan*\n\n` +
-      `Package: *${sel.package}*\n\n` +
-      `Select the plan you want to pay for with USDT:`,
+      `₿ *Pay with Crypto — Choose Your Plan*\n\nPackage: *${sel.package}*\n\nSelect the plan you want to pay for with USDT:`,
       {
         parse_mode: "Markdown",
         reply_markup: {
           inline_keyboard: [
-            [{ text: "1 Day — $5 USDT",         callback_data: "usdt_1day" }],
-            [{ text: "1 Week — $19 USDT",        callback_data: "usdt_1week" }],
-            [{ text: "1 Month — $35 USDT",       callback_data: "usdt_1month" }],
-            [{ text: "6 Months — $90 USDT 🔥",   callback_data: "usdt_6months" }],
-            [{ text: "1 Year — $250 USDT 👑",    callback_data: "usdt_1year" }],
-            [{ text: "⬅️ Back",                   callback_data: backKey }]
+            [{ text: "1 Day — $5 USDT",       callback_data: "usdt_1day" }],
+            [{ text: "1 Week — $19 USDT",      callback_data: "usdt_1week" }],
+            [{ text: "1 Month — $35 USDT",     callback_data: "usdt_1month" }],
+            [{ text: "6 Months — $90 USDT 🔥", callback_data: "usdt_6months" }],
+            [{ text: "1 Year — $250 USDT 👑",  callback_data: "usdt_1year" }],
+            [{ text: "⬅️ Back",                 callback_data: backKey }]
           ]
         }
       }
     );
   }
 
-  // ── USDT plan selected — show wallet + disclaimer ──
   if (data.startsWith("usdt_")) {
     const planMap = {
       usdt_1day:    { label: "1 Day",    usdt: 5 },
@@ -1111,36 +1181,20 @@ bot.on("callback_query", async (query) => {
     clearReminders(chatId);
 
     await bot.sendMessage(chatId,
-      `₿ *Pay with Crypto (USDT)*\n\n` +
-      `📦 *${sel.package}* — *${chosen.label}*\n` +
-      `💰 Amount: *$${chosen.usdt} USDT*\n\n` +
-      `🌍 *Why crypto?*\n` +
-      `• 100% Anonymous — no name, no bank, no trace\n` +
-      `• Auto-detected — access sent the moment we see your payment\n` +
-      `• Secure & global — works from anywhere`,
+      `₿ *Pay with Crypto (USDT)*\n\n📦 *${sel.package}* — *${chosen.label}*\n💰 Amount: *$${chosen.usdt} USDT*\n\n` +
+      `🌍 *Why crypto?*\n• 100% Anonymous — no name, no bank, no trace\n• Auto-detected — access sent the moment we see your payment\n• Secure & global — works from anywhere`,
       { parse_mode: "Markdown" }
     );
 
     await bot.sendMessage(chatId,
-      `📤 *Send Payment*\n\n` +
-      `Send *exactly $${chosen.usdt} USDT* to:\n\n` +
-      `\`${USDT_WALLET}\`\n\n` +
-      `━━━━━━━━━━━━━━━━━━━━━━━━\n` +
-      `🚨 *IMPORTANT — READ BEFORE SENDING* 🚨\n` +
-      `━━━━━━━━━━━━━━━━━━━━━━━━\n\n` +
-      `✅ *CORRECT network:* Tron (TRC20) *ONLY*\n` +
-      `❌ *WRONG:* ERC20 (Ethereum)\n` +
-      `❌ *WRONG:* BEP20 (Binance Smart Chain)\n` +
-      `❌ *WRONG:* Any other network\n\n` +
-      `⛔ *This address only supports Tron (TRC20). Any amount sent to the wrong address or network will result in the permanent loss of your funds. We cannot recover such payments under any circumstances.*\n\n` +
-      `━━━━━━━━━━━━━━━━━━━━━━━━\n\n` +
-      `📋 *Before you send, confirm:*\n` +
-      `☑️ Sending *USDT* (not TRX or any other coin)\n` +
-      `☑️ Network is *TRC20 / Tron*\n` +
-      `☑️ Address starts with *T* (all Tron addresses start with T)\n` +
-      `☑️ Amount is *exactly $${chosen.usdt} USDT*\n\n` +
-      `⏳ Payment window: *30 minutes*\n\n` +
-      `_We're watching for your transaction. Access will be sent automatically once detected._ 🔍`,
+      `📤 *Send Payment*\n\nSend *exactly $${chosen.usdt} USDT* to:\n\n\`${USDT_WALLET}\`\n\n` +
+      `━━━━━━━━━━━━━━━━━━━━━━━━\n🚨 *IMPORTANT — READ BEFORE SENDING* 🚨\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n` +
+      `✅ *CORRECT network:* Tron (TRC20) *ONLY*\n❌ *WRONG:* ERC20 / BEP20 / Any other network\n\n` +
+      `⛔ *Sending to the wrong network = permanent loss of funds. We cannot recover such payments.*\n\n` +
+      `━━━━━━━━━━━━━━━━━━━━━━━━\n\n📋 *Confirm before sending:*\n` +
+      `☑️ Sending *USDT* (not TRX)\n☑️ Network is *TRC20 / Tron*\n` +
+      `☑️ Address starts with *T*\n☑️ Amount is *exactly $${chosen.usdt} USDT*\n\n` +
+      `⏳ Payment window: *30 minutes*\n\n_We're watching for your transaction. Access will be sent automatically once detected._ 🔍`,
       { parse_mode: "Markdown" }
     );
 
@@ -1148,15 +1202,12 @@ bot.on("callback_query", async (query) => {
     return;
   }
 
-  // ── Manual till (fallback only) ──
   if (data === "show_till") {
     const sel = userSelections[chatId];
     if (!sel || !sel.price) return bot.sendMessage(chatId, "⚠️ Please start over with /start.");
     return bot.sendMessage(chatId,
-      `💳 *Manual M-Pesa Payment*\n\n` +
-      `\`\`\`\n${tillCard(sel.package, sel.plan, sel.price)}\n\`\`\`\n\n` +
-      `📲 *Steps:*\n` +
-      `➊ Open M-Pesa\n➋ Lipa na M-Pesa → *Buy Goods & Services*\n` +
+      `💳 *Manual M-Pesa Payment*\n\n\`\`\`\n${tillCard(sel.package, sel.plan, sel.price)}\n\`\`\`\n\n` +
+      `📲 *Steps:*\n➊ Open M-Pesa\n➋ Lipa na M-Pesa → *Buy Goods & Services*\n` +
       `➌ Till: *${TILL_NUMBER}*\n➍ Amount: *Ksh ${sel.price}*\n➎ Confirm with PIN\n\n` +
       `_Once done, tap below to confirm._ ✅`,
       {
@@ -1172,25 +1223,35 @@ bot.on("callback_query", async (query) => {
     );
   }
 
-  // ── Confirm manual payment ──
+  // ── Confirm payment — ask for M-Pesa receipt code ─────────────────────────
   if (data === "confirm_payment") {
     const sel = userSelections[chatId];
     if (!sel || !sel.price) return bot.sendMessage(chatId, "⚠️ Please start over with /start.");
+
+    awaitingReceipt[chatId] = {
+      plan:  sel.plan    || "1 Month",
+      pkg:   sel.package || "N/A",
+      price: sel.price   || 0,
+    };
+
     notifyAdmins(
-      `🔔 *Manual Payment Claim*\n\n👤 \`${chatId}\`\n📦 ${sel.package || "N/A"} — ${sel.plan || "N/A"}\n💰 Ksh ${sel.price}\n\nVerify and use:\n\`/grant ${chatId}\``
+      `🔔 *Payment Claim Received*\n\n👤 \`${chatId}\`\n📦 ${sel.package || "N/A"} — ${sel.plan || "N/A"}\n💰 Ksh ${sel.price}\n\n_Waiting for user to submit M-Pesa confirmation code..._`
     );
+
     return bot.sendMessage(chatId,
-      `⏳ *Got it!*\n\nWe're verifying your transaction. This usually takes *1–2 minutes*.\n\nYou'll get your access link shortly. Hang tight! 🔐`,
+      `📋 *Almost done!*\n\n` +
+      `Please type your *M-Pesa confirmation code* from your payment SMS.\n\n` +
+      `It looks like this: \`RCX4B2K9QP\` — 10 characters\n\n` +
+      `This helps us verify your payment quickly and send your access right away. 🔍`,
       { parse_mode: "Markdown" }
     );
   }
 
-  // ── Need help ──
   if (data === "need_help") {
     return bot.sendMessage(chatId,
       `🛠️ *Need Help?*\n\n` +
       `• *STK push not arriving?* Make sure your number is active on M-Pesa and try again.\n` +
-      `• *Payment deducted but no access?* Tap "I've Paid" on the till screen.\n` +
+      `• *Payment deducted but no access?* Tap "I've Paid" and enter your M-Pesa code.\n` +
       `• *Wrong amount?* Go back and reselect your plan.\n\n` +
       `Still stuck? An admin will assist you shortly. 👇`,
       {
@@ -1206,24 +1267,21 @@ bot.on("callback_query", async (query) => {
     );
   }
 
-  // ── Dismiss reminder ──
   if (data === "dismiss_reminder") {
     clearReminders(chatId);
     return bot.sendMessage(chatId, `👍 No problem! Use /start whenever you're ready.`);
   }
 });
 
-// ─── EXPRESS SERVER ───────────────────────────────────────────────────────────
+// ─── EXPRESS SERVER ──────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`📡 M-Pesa callback URL: ${CALLBACK_URL || "⚠️ NOT SET"}`);
   console.log(`📺 Channel ID: ${CHANNEL_ID}`);
+  console.log(`🌐 Render URL: ${RENDER_URL || "⚠️ NOT SET"}`);
 
   // ─── KEEP ALIVE (prevents Render free tier from sleeping) ────────────────
-  const RENDER_URL = process.env.RENDER_EXTERNAL_URL
-    || (CALLBACK_URL ? CALLBACK_URL.replace("/mpesa/callback", "") : null);
-
   if (RENDER_URL) {
     console.log(`🏓 Keep-alive enabled → pinging ${RENDER_URL} every 10 min`);
     setInterval(() => {
