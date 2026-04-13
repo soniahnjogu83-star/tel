@@ -994,53 +994,9 @@ bot.on("message", async (msg) => {
   const text   = msg.text.trim();
   const sel    = userSelections[chatId];
 
-  // ── Handle M-Pesa receipt code submitted by user ──────────────────────────
-  if (awaitingReceipt[chatId]) {
-    const receiptInfo = awaitingReceipt[chatId];
-    const code = text.toUpperCase();
-
-    if (!/^[A-Z0-9]{10}$/.test(code)) {
-      return bot.sendMessage(chatId,
-        `⚠️ That doesn't look like a valid M-Pesa code.\n\nM-Pesa codes are *10 characters* long, e.g. \`RCX4B2K9QP\`.\n\nPlease check your SMS and try again, or tap below for help.`,
-        {
-          parse_mode: "Markdown",
-          reply_markup: {
-            inline_keyboard: [
-              [{ text: "❓ I Need Help", callback_data: "need_help" }],
-              [{ text: "🔄 Try Again",   callback_data: "pay_stk" }]
-            ]
-          }
-        }
-      );
-    }
-
-    awaitingReceipt[chatId] = { ...receiptInfo, code };
-
-    notifyAdmins(
-      `🔔 *Manual Receipt Submitted*\n\n` +
-      `👤 ChatID: \`${chatId}\`\n` +
-      `📦 ${receiptInfo.pkg || "N/A"} — ${receiptInfo.plan || "N/A"}\n` +
-      `💰 Ksh ${receiptInfo.price || "N/A"}\n` +
-      `🧾 M-Pesa Code: \`${code}\`\n\n` +
-      `Please verify on M-Pesa then tap below to approve 👇`,
-      {
-        reply_markup: {
-          inline_keyboard: [[
-            { text: `✅ Approve & Send Access to ${chatId}`, callback_data: `admin_grant_${chatId}_${receiptInfo.plan || "1 Month"}` }
-          ]]
-        }
-      }
-    );
-
-    return bot.sendMessage(chatId,
-      `✅ *Thank you!*\n\n` +
-      `We've received your M-Pesa code \`${code}\` and our team is verifying it right now. 🔍\n\n` +
-      `You'll receive your access link within a few minutes. We appreciate your patience! 🙏`,
-      { parse_mode: "Markdown" }
-    );
-  }
-
-  // ── Handle phone number for STK push ─────────────────────────────────────
+  // ── Handle phone number for STK push — MUST come before awaitingReceipt ──
+  // Phone numbers like 0712345678 are exactly 10 alphanumeric chars and would
+  // falsely match the M-Pesa code regex if awaitingReceipt were checked first.
   if (sel && sel.awaitingPhone) {
     sel.awaitingPhone = false;
     userSelections[chatId] = sel;
@@ -1106,6 +1062,52 @@ bot.on("message", async (msg) => {
       );
     }
     return;
+  }
+
+  // ── Handle M-Pesa receipt code submitted by user ──────────────────────────
+  if (awaitingReceipt[chatId]) {
+    const receiptInfo = awaitingReceipt[chatId];
+    const code = text.toUpperCase();
+
+    if (!/^[A-Z0-9]{10}$/.test(code)) {
+      return bot.sendMessage(chatId,
+        `⚠️ That doesn't look like a valid M-Pesa code.\n\nM-Pesa codes are *10 characters* long, e.g. \`RCX4B2K9QP\`.\n\nPlease check your SMS and try again, or tap below for help.`,
+        {
+          parse_mode: "Markdown",
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: "❓ I Need Help", callback_data: "need_help" }],
+              [{ text: "🔄 Try Again",   callback_data: "pay_stk" }]
+            ]
+          }
+        }
+      );
+    }
+
+    awaitingReceipt[chatId] = { ...receiptInfo, code };
+
+    notifyAdmins(
+      `🔔 *Manual Receipt Submitted*\n\n` +
+      `👤 ChatID: \`${chatId}\`\n` +
+      `📦 ${receiptInfo.pkg || "N/A"} — ${receiptInfo.plan || "N/A"}\n` +
+      `💰 Ksh ${receiptInfo.price || "N/A"}\n` +
+      `🧾 M-Pesa Code: \`${code}\`\n\n` +
+      `Please verify on M-Pesa then tap below to approve 👇`,
+      {
+        reply_markup: {
+          inline_keyboard: [[
+            { text: `✅ Approve & Send Access to ${chatId}`, callback_data: `admin_grant_${chatId}_${receiptInfo.plan || "1 Month"}` }
+          ]]
+        }
+      }
+    );
+
+    return bot.sendMessage(chatId,
+      `✅ *Thank you!*\n\n` +
+      `We've received your M-Pesa code \`${code}\` and our team is verifying it right now. 🔍\n\n` +
+      `You'll receive your access link within a few minutes. We appreciate your patience! 🙏`,
+      { parse_mode: "Markdown" }
+    );
   }
 
   // ── User typed something freely — try to detect an M-Pesa code ────────────
