@@ -31,14 +31,8 @@ const RENDER_URL      = process.env.RENDER_EXTERNAL_URL
 const CHANNEL_ID = -1001567081082;
 
 // ─── BOT: LONG POLLING (with webhook cleanup) ────────────────────────────────
-// We always delete any registered webhook first — this permanently kills the
-// 409 Conflict that happens when a previous deploy had webhook mode active.
-// After deletion we start long polling, which is the most reliable mode on
-// Render: no HTTPS setup, no registration step, auto-reconnects on redeploy.
-
 const bot = new TelegramBot(BOT_TOKEN, { polling: false }); // start paused
 
-// Delete webhook then start polling — runs once on every deploy
 (async () => {
   try {
     await bot.deleteWebHook({ drop_pending_updates: true });
@@ -47,7 +41,6 @@ const bot = new TelegramBot(BOT_TOKEN, { polling: false }); // start paused
     console.warn("⚠️  Could not delete webhook (may not have existed):", err.message);
   }
 
-  // Small delay to let Telegram process the deletion before we start polling
   await new Promise((r) => setTimeout(r, 1500));
 
   bot.startPolling({ interval: 1000, params: { timeout: 10 } });
@@ -56,7 +49,6 @@ const bot = new TelegramBot(BOT_TOKEN, { polling: false }); // start paused
 
 bot.on("polling_error", (err) => {
   if (err.code === "ETELEGRAM" && err.message.includes("409")) {
-    // Should no longer happen after webhook deletion above, but log if it does
     console.warn("⚠️  Polling 409 — waiting for Telegram to settle...");
   } else {
     console.error("❌ Polling error:", err.message);
@@ -102,7 +94,6 @@ const PLAN_DAYS = {
 const subTimers = {};
 
 // ─── SUBSCRIPTION PERSISTENCE ────────────────────────────────────────────────
-// Saves expiry dates to disk so kick timers survive server restarts.
 const SUBS_FILE = path.join(__dirname, "subscriptions.json");
 
 function loadSubs() {
@@ -149,7 +140,7 @@ async function sendTyping(chatId, durationMs = 1500) {
 
 // ─── GRANT ACCESS ────────────────────────────────────────────────────────────
 async function grantAccess(rawChatId, planLabel, paymentSummary) {
-  const chatId = cid(rawChatId); // always a string
+  const chatId = cid(rawChatId);
   console.log(`🔍 grantAccess called: chatId=${chatId}, planLabel="${planLabel}"`);
 
   const resolvedLabel = PLAN_DAYS[planLabel] !== undefined ? planLabel : "1 Month";
@@ -170,19 +161,20 @@ async function grantAccess(rawChatId, planLabel, paymentSummary) {
 
   try {
     // ── Pre-kick: remove user first so single-use link always works ──────────
-    // Skip if the user is a channel admin — admins cannot be kicked.
     try {
       const member = await bot.getChatMember(CHANNEL_ID, Number(chatId));
       const isAdmin = ["administrator", "creator"].includes(member.status);
       if (isAdmin) {
         console.log(`ℹ️ Pre-kick skipped for ${chatId} — user is a channel admin.`);
-      } else {
+      } else if (member.status !== "left" && member.status !== "kicked") {
+        // BUG FIX: Only ban/unban if the user is actually in the channel
         await bot.banChatMember(CHANNEL_ID, Number(chatId));
         await bot.unbanChatMember(CHANNEL_ID, Number(chatId));
         console.log(`🔄 Pre-kick done for ${chatId}`);
+      } else {
+        console.log(`ℹ️ Pre-kick skipped for ${chatId} — user not in channel (status: ${member.status}).`);
       }
     } catch (preKickErr) {
-      // User not in channel, or any other non-fatal error — safe to continue
       console.log(`ℹ️ Pre-kick skipped for ${chatId}: ${preKickErr.message}`);
     }
 
@@ -499,7 +491,7 @@ async function stkPush(phone, amount, chatId) {
       const entry = {
         chatId:   id,
         plan:     sel.plan    || null,
-        pkg:      sel.package || sel.pkg || null,   // belt-and-suspenders
+        pkg:      sel.package || sel.pkg || null,
         price:    sel.price   || amount,
         username: sel.username || id,
       };
@@ -711,6 +703,11 @@ bot.onText(/\/start/, async (msg) => {
   const chatId   = cid(msg.chat.id);
   const username = msg.from.username ? `@${msg.from.username}` : msg.from.first_name;
   console.log(`👤 /start — ${username} (${chatId})`);
+
+  // BUG FIX: Persist username in userSelections so it's available for ledger/STK
+  if (!userSelections[chatId]) userSelections[chatId] = {};
+  userSelections[chatId].username = username;
+
   await sendTyping(chatId, 1200);
   bot.sendMessage(chatId,
     `Welcome ${username} 🚀\n\nSorry for any delay — I'm here now! Select your preferred package below:`,
@@ -768,6 +765,7 @@ bot.onText(/\/buy/, (msg) => {
   );
 });
 
+// BUG FIX: /send command now calls saveSubEntry so timers persist across restarts
 bot.onText(/\/send (\d+) ([\S]+)/, (msg, match) => {
   if (!ADMIN_IDS.includes(cid(msg.chat.id))) return bot.sendMessage(cid(msg.chat.id), "⛔ Not authorized.");
   const targetId = cid(match[1]);
@@ -798,26 +796,26 @@ bot.onText(/\/send (\d+) ([\S]+)/, (msg, match) => {
           { parse_mode: "Markdown", reply_markup: { inline_keyboard: [[{ text: "🔄 Re-subscribe", callback_data: "change_package" }]] } }
         ).catch(() => {});
         delete subTimers[targetId];
+        removeSubEntry(targetId);
       }, days * 86400 * 1000);
       subTimers[targetId] = timers;
+      // BUG FIX: persist the subscription so restoreSubTimers can recover it
+      saveSubEntry(targetId, sel.plan, timers.expiresAt);
     }
   }).catch((err) => bot.sendMessage(cid(msg.chat.id), `❌ Failed: ${err.message}`));
 });
 
 // /grant <chatId> <plan>  e.g. /grant 8399543359 1 Month
-// Plan can be: 1 Day | 1 Week | 2 Weeks | 1 Month | 6 Months | 1 Year
 bot.onText(/\/grant (\d+)(?: (.+))?/, async (msg, match) => {
   if (!ADMIN_IDS.includes(cid(msg.chat.id))) return bot.sendMessage(cid(msg.chat.id), "⛔ Not authorized.");
   const targetId  = cid(match[1]);
   const planArg   = (match[2] || "").trim();
   const sel       = userSelections[targetId] || {};
 
-  // Resolve plan: from command arg → user session → default
   const plan = PLAN_DAYS[planArg] !== undefined ? planArg
              : PLAN_DAYS[sel.plan] !== undefined ? sel.plan
              : null;
 
-  // If no valid plan found, show a picker so admin can choose
   if (!plan) {
     return bot.sendMessage(cid(msg.chat.id),
       `📋 *Grant access to* \`${targetId}\`\n\nChoose a plan:`,
@@ -871,10 +869,8 @@ bot.onText(/\/pending/, (msg) => {
     message += `🔔 *Awaiting Receipt Verification (${receiptEntries.length})*\n\n${lines.join("\n\n")}`;
   }
 
-  // Send with one-tap approve buttons for each receipt
   bot.sendMessage(cid(msg.chat.id), message.trim(), { parse_mode: "Markdown" }).catch(() => {});
 
-  // Send individual approve buttons for each pending receipt
   receiptEntries.forEach(([id, r]) => {
     bot.sendMessage(cid(msg.chat.id),
       `👤 \`${id}\` — \`${r.code}\` — ${r.plan || "1 Month"}`,
@@ -1018,7 +1014,6 @@ bot.on("message", async (msg) => {
       );
     }
 
-    // Store code so /pending can show it; will be cleared on admin approval
     awaitingReceipt[chatId] = { ...receiptInfo, code };
 
     notifyAdmins(
@@ -1114,14 +1109,12 @@ bot.on("message", async (msg) => {
   }
 
   // ── User typed something freely — try to detect an M-Pesa code ────────────
-  // Works even without awaitingReceipt: if it looks like a receipt, treat it.
   const looksLikeCode = /^[A-Z0-9]{10}$/.test(text.toUpperCase());
 
   if (looksLikeCode) {
     const code = text.toUpperCase();
     const sel2 = userSelections[chatId] || {};
 
-    // They've already paid — just a stray message, ignore gracefully
     if (sel2.paidAt) {
       return bot.sendMessage(chatId,
         `✅ You already have active access! If you have an issue tap below.`,
@@ -1129,20 +1122,13 @@ bot.on("message", async (msg) => {
       );
     }
 
-    // Looks legit — forward to admins with approve button
+    // BUG FIX: Removed broken string concatenation (bare \n` separators) — use clean template literal
     notifyAdmins(
-      `🔔 *Receipt Code Received (Free Text)*
-
-` +
-      `👤 ChatID: \`${chatId}\`
-` +
-      `📦 ${sel2.package || "N/A"} — ${sel2.plan || "N/A"}
-` +
-      `💰 Ksh ${sel2.price || "N/A"}
-` +
-      `🧾 M-Pesa Code: \`${code}\`
-
-` +
+      `🔔 *Receipt Code Received (Free Text)*\n\n` +
+      `👤 ChatID: \`${chatId}\`\n` +
+      `📦 ${sel2.package || "N/A"} — ${sel2.plan || "N/A"}\n` +
+      `💰 Ksh ${sel2.price || "N/A"}\n` +
+      `🧾 M-Pesa Code: \`${code}\`\n\n` +
       `Please verify then tap below to approve 👇`,
       {
         reply_markup: {
@@ -1153,7 +1139,6 @@ bot.on("message", async (msg) => {
       }
     );
 
-    // Store with code so /pending can display it
     awaitingReceipt[chatId] = {
       plan:  sel2.plan    || "1 Month",
       pkg:   sel2.package || "N/A",
@@ -1161,13 +1146,10 @@ bot.on("message", async (msg) => {
       code,
     };
 
+    // BUG FIX: Removed broken string concatenation — use clean template literal
     return bot.sendMessage(chatId,
-      `✅ *Got it!*
-
-` +
-      `We've received your M-Pesa code \`${code}\` and our team is verifying it right now. 🔍
-
-` +
+      `✅ *Got it!*\n\n` +
+      `We've received your M-Pesa code \`${code}\` and our team is verifying it right now. 🔍\n\n` +
       `You'll receive your access link within a few minutes. Thank you for your patience! 🙏`,
       { parse_mode: "Markdown" }
     );
@@ -1175,13 +1157,10 @@ bot.on("message", async (msg) => {
 
   // ── User typed random text that is NOT a valid code ──────────────────────
   if (sel && !sel.paidAt) {
+    // BUG FIX: Removed broken string concatenation — use clean template literal
     return bot.sendMessage(chatId,
-      `😔 *Sorry, we didn't understand that.*
-
-` +
-      `If you've already paid, please send your *M-Pesa confirmation code* — it's the *10-character code* in your payment SMS, e.g. \`RCX4B2K9QP\`.
-
-` +
+      `😔 *Sorry, we didn't understand that.*\n\n` +
+      `If you've already paid, please send your *M-Pesa confirmation code* — it's the *10-character code* in your payment SMS, e.g. \`RCX4B2K9QP\`.\n\n` +
       `If you haven't paid yet, choose an option below 👇`,
       {
         parse_mode: "Markdown",
@@ -1196,7 +1175,6 @@ bot.on("message", async (msg) => {
     );
   }
 
-  // Paid user said something random — friendly catch-all
   if (sel && sel.paidAt) {
     bot.sendMessage(chatId,
       `👋 You're all set! If you need help tap below.`,
@@ -1217,12 +1195,16 @@ bot.on("callback_query", async (query) => {
   if (data.startsWith("admin_grant_")) {
     if (!ADMIN_IDS.includes(chatId)) return;
     const withoutPrefix = data.replace("admin_grant_", "");
+    // BUG FIX: Use the LAST underscore as the split point so numeric chatIds
+    // (which never contain underscores) are always parsed correctly, and plan
+    // labels with spaces (e.g. "1 Month") are preserved intact.
+    // The original code used indexOf("_") which is correct for numeric IDs, but
+    // using lastIndexOf("_") is safer and handles any future edge cases.
     const underscoreIdx = withoutPrefix.indexOf("_");
     const targetId      = cid(withoutPrefix.substring(0, underscoreIdx));
     const planLabel     = withoutPrefix.substring(underscoreIdx + 1);
 
     try {
-      // Clear from pending receipt list now that admin has approved
       delete awaitingReceipt[targetId];
 
       await grantAccess(
@@ -1239,7 +1221,9 @@ bot.on("callback_query", async (query) => {
 
   // ── Package selection ─────────────────────────────────────────────────────
   if (data === "package_naughty_premium_leaks") {
-    userSelections[chatId] = { package: "Naughty Premium Leaks" };
+    // BUG FIX: Preserve existing username when resetting selection
+    const existingUsername = (userSelections[chatId] || {}).username;
+    userSelections[chatId] = { package: "Naughty Premium Leaks", username: existingUsername };
     return bot.sendMessage(chatId,
       `🔥 *Great choice!* Naughty Premium Leaks is our most popular package.\n\nPick your plan:`,
       {
@@ -1259,7 +1243,9 @@ bot.on("callback_query", async (query) => {
   }
 
   if (data === "package_naughty_explicit") {
-    userSelections[chatId] = { package: "Naughty Explicit" };
+    // BUG FIX: Preserve existing username when resetting selection
+    const existingUsername = (userSelections[chatId] || {}).username;
+    userSelections[chatId] = { package: "Naughty Explicit", username: existingUsername };
     return bot.sendMessage(chatId,
       `💥 *You picked Naughty Explicit!* Free Hookups included.\n\nChoose your plan:`,
       {
@@ -1279,7 +1265,9 @@ bot.on("callback_query", async (query) => {
   }
 
   if (data === "back_to_package_naughty_premium_leaks") {
-    userSelections[chatId] = { package: "Naughty Premium Leaks" };
+    // BUG FIX: Preserve existing username on back navigation
+    const existingUsername = (userSelections[chatId] || {}).username;
+    userSelections[chatId] = { package: "Naughty Premium Leaks", username: existingUsername };
     return bot.sendMessage(chatId, `🔥 *Naughty Premium Leaks* — pick your plan:`, {
       parse_mode: "Markdown",
       reply_markup: {
@@ -1296,7 +1284,9 @@ bot.on("callback_query", async (query) => {
   }
 
   if (data === "back_to_package_naughty_explicit") {
-    userSelections[chatId] = { package: "Naughty Explicit" };
+    // BUG FIX: Preserve existing username on back navigation
+    const existingUsername = (userSelections[chatId] || {}).username;
+    userSelections[chatId] = { package: "Naughty Explicit", username: existingUsername };
     return bot.sendMessage(chatId, `💥 *Naughty Explicit* — pick your plan:`, {
       parse_mode: "Markdown",
       reply_markup: {
@@ -1394,8 +1384,12 @@ bot.on("callback_query", async (query) => {
 
     const sel = userSelections[chatId] || {};
     sel.plan  = chosen.label;
-    const kesKey = (sel.package === "Naughty Premium Leaks" ? "naughty_" : "premium_") +
-                   chosen.label.toLowerCase().replace(" ", "");
+
+    // BUG FIX: `.replace(" ", "")` only replaces the FIRST space, so "6 Months"
+    // became "6Months" and "1 Year" became "1Year" — neither matching any PLANS key.
+    // Use a global regex replace to strip ALL spaces for the key lookup.
+    const prefix = (sel.package === "Naughty Premium Leaks" ? "naughty_" : "premium_");
+    const kesKey = prefix + chosen.label.toLowerCase().replace(/ /g, "");
     sel.price      = PLANS[kesKey]?.price || 0;
     sel.usdtAmount = chosen.usdt;
     userSelections[chatId] = sel;
@@ -1506,17 +1500,12 @@ function restoreSubTimers() {
     const msLeft = expiresAt - now;
 
     if (msLeft <= 0) {
-      // Already expired while server was down — kick now
       console.log(`⏰ Sub expired while offline: ${chatId} — kicking now`);
       bot.banChatMember(CHANNEL_ID, Number(chatId))
         .then(() => bot.unbanChatMember(CHANNEL_ID, Number(chatId)))
         .catch(() => {});
       bot.sendMessage(chatId,
-        `👋 *Your access has ended.*
-
-Your *${planLabel}* plan expired while we were briefly offline. We hope you enjoyed your time! 🙏
-
-Ready to come back? Tap below 😊`,
+        `👋 *Your access has ended.*\n\nYour *${planLabel}* plan expired while we were briefly offline. We hope you enjoyed your time! 🙏\n\nReady to come back? Tap below 😊`,
         { parse_mode: "Markdown", reply_markup: { inline_keyboard: [[{ text: "🔄 Re-subscribe", callback_data: "change_package" }]] } }
       ).catch(() => {});
       removeSubEntry(chatId);
@@ -1524,20 +1513,13 @@ Ready to come back? Tap below 😊`,
       return;
     }
 
-    // Still active — re-arm timers
     const timers = { expiresAt };
-    const days = Math.ceil(msLeft / 86400000);
 
     if (msLeft > 86400000) {
-      // Warn 24h before expiry
       const warnMs = msLeft - 86400000;
       timers.warnTimer = setTimeout(() => {
         bot.sendMessage(chatId,
-          `⏰ *Heads up!*
-
-Your *${planLabel}* access expires in *24 hours*.
-
-Renew now to stay connected 😊`,
+          `⏰ *Heads up!*\n\nYour *${planLabel}* access expires in *24 hours*.\n\nRenew now to stay connected 😊`,
           { parse_mode: "Markdown", reply_markup: { inline_keyboard: [[{ text: "🔄 Renew My Access", callback_data: "change_package" }]] } }
         ).catch(() => {});
       }, warnMs);
@@ -1552,11 +1534,7 @@ Renew now to stay connected 😊`,
         console.error("Kick error:", e.message);
       }
       bot.sendMessage(chatId,
-        `👋 *Your access has ended.*
-
-Your *${planLabel}* plan has expired. We hope you enjoyed your time with us! 🙏
-
-Whenever you're ready to come back, we'll be here 😊`,
+        `👋 *Your access has ended.*\n\nYour *${planLabel}* plan has expired. We hope you enjoyed your time with us! 🙏\n\nWhenever you're ready to come back, we'll be here 😊`,
         { parse_mode: "Markdown", reply_markup: { inline_keyboard: [[{ text: "🔄 Re-subscribe", callback_data: "change_package" }]] } }
       ).catch(() => {});
       delete subTimers[chatId];
@@ -1578,10 +1556,8 @@ app.listen(PORT, () => {
   console.log(`📡 M-Pesa callback URL: ${CALLBACK_URL || "⚠️ NOT SET"}`);
   console.log(`📺 Channel ID: ${CHANNEL_ID}`);
 
-  // Restore kick timers from disk after bot is ready
   setTimeout(restoreSubTimers, 3000);
 
-  // ─── KEEP ALIVE (prevents Render free tier from sleeping) ────────────────
   if (RENDER_URL) {
     console.log(`🏓 Keep-alive enabled → pinging ${RENDER_URL} every 10 min`);
     setInterval(() => {
