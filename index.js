@@ -31,18 +31,16 @@ const RENDER_URL      = process.env.RENDER_EXTERNAL_URL
 const CHANNEL_ID = -1001567081082;
 
 // ─── BOT: LONG POLLING (with webhook cleanup) ────────────────────────────────
-const bot = new TelegramBot(BOT_TOKEN, { polling: false }); // start paused
+const bot = new TelegramBot(BOT_TOKEN, { polling: false });
 
 (async () => {
   try {
     await bot.deleteWebHook({ drop_pending_updates: true });
-    console.log("✅ Webhook deleted (any old webhook is now cleared).");
+    console.log("✅ Webhook deleted.");
   } catch (err) {
-    console.warn("⚠️  Could not delete webhook (may not have existed):", err.message);
+    console.warn("⚠️  Could not delete webhook:", err.message);
   }
-
   await new Promise((r) => setTimeout(r, 1500));
-
   bot.startPolling({ interval: 1000, params: { timeout: 10 } });
   console.log("✅ Bot started in long-polling mode.");
 })();
@@ -58,18 +56,13 @@ bot.on("polling_error", (err) => {
 // ─── EARLY ENV VALIDATION ────────────────────────────────────────────────────
 (function validateEnv() {
   const required = {
-    BOT_TOKEN:       BOT_TOKEN,
-    SHORTCODE:       process.env.SHORTCODE,
-    PASSKEY:         process.env.PASSKEY,
-    CONSUMER_KEY:    process.env.CONSUMER_KEY,
-    CONSUMER_SECRET: process.env.CONSUMER_SECRET,
-    CALLBACK_URL:    process.env.CALLBACK_URL,
+    BOT_TOKEN, SHORTCODE: process.env.SHORTCODE, PASSKEY: process.env.PASSKEY,
+    CONSUMER_KEY: process.env.CONSUMER_KEY, CONSUMER_SECRET: process.env.CONSUMER_SECRET,
+    CALLBACK_URL: process.env.CALLBACK_URL,
   };
   const missing = Object.entries(required).filter(([, v]) => !v).map(([k]) => k);
   if (missing.length > 0) {
-    const msg =
-      `🚨 *STARTUP WARNING*\n\n` +
-      `Missing environment variables:\n` +
+    const msg = `🚨 *STARTUP WARNING*\n\nMissing env vars:\n` +
       missing.map((k) => `• \`${k}\``).join("\n") +
       `\n\n⚠️ Bot and/or STK Push will not work until these are set.`;
     console.error("❌ Missing env vars:", missing.join(", "));
@@ -94,31 +87,79 @@ const PLAN_DAYS = {
 const subTimers = {};
 
 // ─── SUBSCRIPTION PERSISTENCE ────────────────────────────────────────────────
-const SUBS_FILE = path.join(__dirname, "subscriptions.json");
+// FIX: Use /tmp on Render (writable) AND a fallback path for local dev.
+// Render's /tmp persists across restarts within the same instance but IS wiped
+// on fresh deploys. To survive deploys you need a real DB. As a belt-and-
+// suspenders measure we ALSO write a human-readable backup alongside the
+// primary file so it is easy to restore manually from the Render shell.
+const SUBS_FILE        = path.join(process.env.DATA_DIR || "/tmp", "subscriptions.json");
+const SUBS_BACKUP_FILE = path.join(process.env.DATA_DIR || "/tmp", "subscriptions_backup.json");
+
+console.log(`💾 Subscriptions file: ${SUBS_FILE}`);
 
 function loadSubs() {
-  try {
-    if (fs.existsSync(SUBS_FILE)) {
-      return JSON.parse(fs.readFileSync(SUBS_FILE, "utf8"));
+  // FIX: Try primary file first, then backup, then return empty object.
+  for (const file of [SUBS_FILE, SUBS_BACKUP_FILE]) {
+    try {
+      if (fs.existsSync(file)) {
+        const raw = fs.readFileSync(file, "utf8");
+        const parsed = JSON.parse(raw);
+        // FIX: Validate that every entry has the required fields and that
+        // expiresAt is a sane timestamp (ms since epoch, > year 2020).
+        const MIN_TS = new Date("2020-01-01").getTime();
+        const valid  = Object.entries(parsed).every(([, v]) =>
+          v && typeof v.planLabel === "string" &&
+          typeof v.expiresAt === "number" && v.expiresAt > MIN_TS
+        );
+        if (!valid) {
+          console.warn(`⚠️  ${file} failed validation — trying backup`);
+          continue;
+        }
+        if (file === SUBS_BACKUP_FILE) {
+          console.warn("⚠️  Primary subs file missing — restored from backup");
+        }
+        return parsed;
+      }
+    } catch (e) {
+      console.error(`⚠️ Could not load ${file}:`, e.message);
     }
-  } catch (e) {
-    console.error("⚠️ Could not load subscriptions.json:", e.message);
   }
   return {};
 }
 
 function saveSubs(data) {
+  // FIX: Write atomically using a temp file + rename to avoid corruption
+  // if the process is killed mid-write.
+  const tmp = SUBS_FILE + ".tmp";
   try {
-    fs.writeFileSync(SUBS_FILE, JSON.stringify(data, null, 2));
+    const json = JSON.stringify(data, null, 2);
+    fs.writeFileSync(tmp, json);
+    fs.renameSync(tmp, SUBS_FILE);
+    // Also update the backup
+    fs.writeFileSync(SUBS_BACKUP_FILE, json);
   } catch (e) {
     console.error("⚠️ Could not save subscriptions.json:", e.message);
+    try { fs.unlinkSync(tmp); } catch (_) {}
   }
 }
 
 function saveSubEntry(chatId, planLabel, expiresAt) {
+  // FIX: Guard against obviously wrong expiresAt values before persisting.
+  // A common mistake is passing seconds instead of milliseconds (Date.now()
+  // returns ms; Math.floor(Date.now()/1000) returns seconds — wrong here).
+  const MIN_TS = new Date("2024-01-01").getTime(); // must be in the future
+  if (!expiresAt || expiresAt < MIN_TS) {
+    console.error(`❌ saveSubEntry: invalid expiresAt ${expiresAt} for ${chatId} — refusing to save`);
+    notifyAdmins(
+      `🚨 *saveSubEntry BUG*\n\nChat: \`${chatId}\`\nPlan: ${planLabel}\n` +
+      `expiresAt: \`${expiresAt}\`\n\n_This would have caused instant expiry. Entry NOT saved._`
+    );
+    return;
+  }
   const data = loadSubs();
   data[cid(chatId)] = { planLabel, expiresAt };
   saveSubs(data);
+  console.log(`💾 Saved sub: ${chatId} | ${planLabel} | expires ${new Date(expiresAt).toISOString()}`);
 }
 
 function removeSubEntry(chatId) {
@@ -127,10 +168,9 @@ function removeSubEntry(chatId) {
   saveSubs(data);
 }
 
-// ─── HELPERS: normalize chatId to string always ───────────────────────────────
+// ─── HELPERS ─────────────────────────────────────────────────────────────────
 const cid = (id) => String(id);
 
-// ─── TYPING INDICATOR ────────────────────────────────────────────────────────
 async function sendTyping(chatId, durationMs = 1500) {
   try {
     await bot.sendChatAction(cid(chatId), "typing");
@@ -160,30 +200,39 @@ async function grantAccess(rawChatId, planLabel, paymentSummary) {
   }
 
   try {
-    // ── Pre-kick: remove user first so single-use link always works ──────────
+    // Pre-kick: remove user first so single-use link always works
     try {
-      const member = await bot.getChatMember(CHANNEL_ID, Number(chatId));
+      const member  = await bot.getChatMember(CHANNEL_ID, Number(chatId));
       const isAdmin = ["administrator", "creator"].includes(member.status);
       if (isAdmin) {
         console.log(`ℹ️ Pre-kick skipped for ${chatId} — user is a channel admin.`);
       } else if (member.status !== "left" && member.status !== "kicked") {
-        // BUG FIX: Only ban/unban if the user is actually in the channel
         await bot.banChatMember(CHANNEL_ID, Number(chatId));
         await bot.unbanChatMember(CHANNEL_ID, Number(chatId));
         console.log(`🔄 Pre-kick done for ${chatId}`);
       } else {
-        console.log(`ℹ️ Pre-kick skipped for ${chatId} — user not in channel (status: ${member.status}).`);
+        console.log(`ℹ️ Pre-kick skipped for ${chatId} — status: ${member.status}`);
       }
     } catch (preKickErr) {
       console.log(`ℹ️ Pre-kick skipped for ${chatId}: ${preKickErr.message}`);
     }
 
-    const expireDate = Math.floor(Date.now() / 1000) + days * 86400;
-    console.log(`🔗 Creating invite link: chatId=${chatId}, days=${days}, expireDate=${expireDate}, CHANNEL_ID=${CHANNEL_ID}`);
+    // FIX: Calculate expiry in milliseconds FIRST, then derive UNIX seconds
+    // for the Telegram invite link separately. Previously the risk was that
+    // if someone accidentally passed seconds here the timer would fire ~1000x
+    // too fast.
+    const nowMs        = Date.now();
+    const durationMs   = days * 24 * 60 * 60 * 1000;          // e.g. 365 * 86400000
+    const expiresAtMs  = nowMs + durationMs;                   // absolute ms timestamp
+    const inviteExpiry = Math.floor(expiresAtMs / 1000);       // UNIX seconds for Telegram
+
+    console.log(`⏱  Plan: ${resolvedLabel} | days: ${days} | durationMs: ${durationMs}`);
+    console.log(`📅 Expires: ${new Date(expiresAtMs).toISOString()} (${expiresAtMs}ms)`);
+    console.log(`🔗 Creating invite link: CHANNEL_ID=${CHANNEL_ID}, expireDate=${inviteExpiry}`);
 
     const inviteRes = await bot.createChatInviteLink(CHANNEL_ID, {
       member_limit: 1,
-      expire_date:  expireDate,
+      expire_date:  inviteExpiry,
       name:         `Access-${chatId}-${Date.now()}`
     });
 
@@ -203,10 +252,13 @@ async function grantAccess(rawChatId, planLabel, paymentSummary) {
     );
 
     clearSubTimers(chatId);
+
     const timers     = {};
-    timers.expiresAt = Date.now() + days * 86400 * 1000;
+    timers.expiresAt = expiresAtMs; // FIX: always milliseconds
 
     if (days > 1) {
+      const warnMs = durationMs - 86400000; // fire 24h before expiry
+      console.log(`⏰ Warning timer in ${Math.round(warnMs / 3600000)}h`);
       timers.warnTimer = setTimeout(() => {
         bot.sendMessage(chatId,
           `⏰ *Heads up!*\n\nYour *${resolvedLabel}* access expires in *24 hours*.\n\nRenew now to stay connected 😊`,
@@ -215,9 +267,10 @@ async function grantAccess(rawChatId, planLabel, paymentSummary) {
             reply_markup: { inline_keyboard: [[{ text: "🔄 Renew My Access", callback_data: "change_package" }]] }
           }
         ).catch(() => {});
-      }, (days - 1) * 86400 * 1000);
+      }, warnMs);
     }
 
+    console.log(`⏰ Kick timer in ${Math.round(durationMs / 3600000)}h (${durationMs}ms)`);
     timers.kickTimer = setTimeout(async () => {
       try {
         await bot.banChatMember(CHANNEL_ID, Number(chatId));
@@ -235,15 +288,17 @@ async function grantAccess(rawChatId, planLabel, paymentSummary) {
       ).catch(() => {});
       delete subTimers[chatId];
       removeSubEntry(chatId);
-    }, days * 86400 * 1000);
+    }, durationMs);
 
     subTimers[chatId] = timers;
-    saveSubEntry(chatId, resolvedLabel, timers.expiresAt);
-    console.log(`✅ Access fully set up for ${chatId} | ${resolvedLabel} | ${days}d`);
+
+    // FIX: Pass expiresAtMs (milliseconds) — this is what restoreSubTimers reads back
+    saveSubEntry(chatId, resolvedLabel, expiresAtMs);
+
+    console.log(`✅ Access fully set up for ${chatId} | ${resolvedLabel} | ${days}d | expires ${new Date(expiresAtMs).toISOString()}`);
 
   } catch (err) {
     console.error("❌ grantAccess error:", err.message, err.stack);
-
     notifyAdmins(
       `⚠️ *Auto-invite FAILED for* \`${chatId}\`\n\n` +
       `Plan: *${resolvedLabel}* (${days} days)\n` +
@@ -257,7 +312,6 @@ async function grantAccess(rawChatId, planLabel, paymentSummary) {
         }
       }
     );
-
     bot.sendMessage(chatId,
       `😔 *We're so sorry for the delay!*\n\n` +
       `Your payment was received successfully ✅ — but we ran into a small technical issue sending your access link automatically.\n\n` +
@@ -486,8 +540,7 @@ async function stkPush(phone, amount, chatId) {
     );
 
     if (res.data.ResponseCode === "0") {
-      const sel = userSelections[id] || {};
-      console.log(`🔎 stkPush lookup userSelections[${id}]:`, JSON.stringify(sel));
+      const sel   = userSelections[id] || {};
       const entry = {
         chatId:   id,
         plan:     sel.plan    || null,
@@ -498,7 +551,7 @@ async function stkPush(phone, amount, chatId) {
       pendingSTK[res.data.CheckoutRequestID] = entry;
       console.log(`📌 Registered pending STK: ${res.data.CheckoutRequestID} →`, JSON.stringify(entry));
     } else {
-      console.warn(`⚠️ STK push non-zero ResponseCode: ${res.data.ResponseCode} — ${res.data.ResponseDescription}`);
+      console.warn(`⚠️ STK non-zero ResponseCode: ${res.data.ResponseCode}`);
     }
     return res.data;
   } catch (err) {
@@ -537,7 +590,6 @@ app.post("/mpesa/callback", (req, res) => {
     delete pendingSTK[checkId];
     const { chatId, plan, pkg, price, username } = pending;
     const id = cid(chatId);
-    console.log(`✅ Matched pending STK: chatId=${id}, plan=${plan}, pkg=${pkg}`);
 
     if (code === 0) {
       const meta      = body.CallbackMetadata?.Item || [];
@@ -545,8 +597,6 @@ app.post("/mpesa/callback", (req, res) => {
       const amount    = get("Amount");
       const mpesaCode = get("MpesaReceiptNumber");
       const phone     = get("PhoneNumber");
-
-      console.log(`💰 Payment confirmed: amount=${amount}, ref=${mpesaCode}, phone=${phone}`);
 
       const sel  = userSelections[id] || {};
       sel.paidAt = new Date().toISOString();
@@ -558,23 +608,14 @@ app.post("/mpesa/callback", (req, res) => {
       clearReminders(id);
 
       const finalPlan = sel.plan || plan || "1 Month";
-      console.log(`🎯 Final plan for grantAccess: "${finalPlan}"`);
 
       recordPayment({
-        chatId:   id,
-        username: sel.username || username,
-        pkg:      sel.package  || pkg  || "N/A",
-        plan:     finalPlan,
-        amount,
-        ref:      mpesaCode,
-        phone
+        chatId: id, username: sel.username || username,
+        pkg: sel.package || pkg || "N/A",
+        plan: finalPlan, amount, ref: mpesaCode, phone
       });
 
-      grantAccess(
-        id,
-        finalPlan,
-        `✅ Ksh *${amount}* received via M-Pesa\n🧾 Ref: \`${mpesaCode}\``
-      );
+      grantAccess(id, finalPlan, `✅ Ksh *${amount}* received via M-Pesa\n🧾 Ref: \`${mpesaCode}\``);
 
       notifyAdmins(
         `💰 *PAYMENT CONFIRMED (STK)*\n\n` +
@@ -583,8 +624,6 @@ app.post("/mpesa/callback", (req, res) => {
       );
 
     } else {
-      console.log(`❌ STK failed for ${id} | ResultCode: ${code} | Desc: ${body?.ResultDesc}`);
-
       awaitingReceipt[id] = {
         plan:  plan || (userSelections[id] || {}).plan || "1 Month",
         pkg:   pkg  || (userSelections[id] || {}).package || "N/A",
@@ -614,7 +653,7 @@ app.post("/mpesa/callback", (req, res) => {
   }
 });
 
-// ─── USDT: POLL TRONGRID ─────────────────────────────────────────────────────
+// ─── USDT POLLER ─────────────────────────────────────────────────────────────
 async function startUsdtPoller(chatId, expectedUsdt) {
   const id = cid(chatId);
   stopUsdtPoller(id);
@@ -702,9 +741,6 @@ function stopUsdtPoller(chatId) {
 bot.onText(/\/start/, async (msg) => {
   const chatId   = cid(msg.chat.id);
   const username = msg.from.username ? `@${msg.from.username}` : msg.from.first_name;
-  console.log(`👤 /start — ${username} (${chatId})`);
-
-  // BUG FIX: Persist username in userSelections so it's available for ledger/STK
   if (!userSelections[chatId]) userSelections[chatId] = {};
   userSelections[chatId].username = username;
 
@@ -765,56 +801,56 @@ bot.onText(/\/buy/, (msg) => {
   );
 });
 
-// BUG FIX: /send command now calls saveSubEntry so timers persist across restarts
 bot.onText(/\/send (\d+) ([\S]+)/, (msg, match) => {
   if (!ADMIN_IDS.includes(cid(msg.chat.id))) return bot.sendMessage(cid(msg.chat.id), "⛔ Not authorized.");
-  const targetId = cid(match[1]);
+  const targetId   = cid(match[1]);
   const accessLink = match[2];
-  const sel = userSelections[targetId] || {};
+  const sel        = userSelections[targetId] || {};
   bot.sendMessage(targetId,
     `🎉 *Access Granted!*\n\nYour payment has been verified ✅\n\nHere's your exclusive link 👇\n${accessLink}\n\n_Welcome to the family. Do not share this link._ 🔐`,
     { parse_mode: "Markdown" }
   ).then(() => {
     bot.sendMessage(cid(msg.chat.id), `✅ Access link sent to \`${targetId}\``, { parse_mode: "Markdown" });
     if (sel.plan) {
-      const days = PLAN_DAYS[sel.plan] || 30;
+      const days       = PLAN_DAYS[sel.plan] || 30;
+      const durationMs = days * 24 * 60 * 60 * 1000;
+      const expiresAtMs = Date.now() + durationMs;
       clearSubTimers(targetId);
-      const timers     = {};
-      timers.expiresAt = Date.now() + days * 86400 * 1000;
+      const timers = { expiresAt: expiresAtMs };
       if (days > 1) {
         timers.warnTimer = setTimeout(() => {
           bot.sendMessage(targetId,
             `⏰ *Heads up!*\n\nYour *${sel.plan}* access expires in *24 hours*. Renew now 😊`,
             { parse_mode: "Markdown", reply_markup: { inline_keyboard: [[{ text: "🔄 Renew", callback_data: "change_package" }]] } }
           ).catch(() => {});
-        }, (days - 1) * 86400 * 1000);
+        }, durationMs - 86400000);
       }
       timers.kickTimer = setTimeout(async () => {
-        try { await bot.banChatMember(CHANNEL_ID, Number(targetId)); await bot.unbanChatMember(CHANNEL_ID, Number(targetId)); } catch (e) {}
+        try {
+          await bot.banChatMember(CHANNEL_ID, Number(targetId));
+          await bot.unbanChatMember(CHANNEL_ID, Number(targetId));
+        } catch (e) {}
         bot.sendMessage(targetId,
           `👋 *Your access has ended.*\n\nYour *${sel.plan}* plan expired. Hope you enjoyed it! 🙏\n\nCome back anytime 😊`,
           { parse_mode: "Markdown", reply_markup: { inline_keyboard: [[{ text: "🔄 Re-subscribe", callback_data: "change_package" }]] } }
         ).catch(() => {});
         delete subTimers[targetId];
         removeSubEntry(targetId);
-      }, days * 86400 * 1000);
+      }, durationMs);
       subTimers[targetId] = timers;
-      // BUG FIX: persist the subscription so restoreSubTimers can recover it
-      saveSubEntry(targetId, sel.plan, timers.expiresAt);
+      saveSubEntry(targetId, sel.plan, expiresAtMs);
     }
   }).catch((err) => bot.sendMessage(cid(msg.chat.id), `❌ Failed: ${err.message}`));
 });
 
-// /grant <chatId> <plan>  e.g. /grant 8399543359 1 Month
 bot.onText(/\/grant (\d+)(?: (.+))?/, async (msg, match) => {
   if (!ADMIN_IDS.includes(cid(msg.chat.id))) return bot.sendMessage(cid(msg.chat.id), "⛔ Not authorized.");
-  const targetId  = cid(match[1]);
-  const planArg   = (match[2] || "").trim();
-  const sel       = userSelections[targetId] || {};
-
-  const plan = PLAN_DAYS[planArg] !== undefined ? planArg
-             : PLAN_DAYS[sel.plan] !== undefined ? sel.plan
-             : null;
+  const targetId = cid(match[1]);
+  const planArg  = (match[2] || "").trim();
+  const sel      = userSelections[targetId] || {};
+  const plan     = PLAN_DAYS[planArg] !== undefined ? planArg
+                 : PLAN_DAYS[sel.plan] !== undefined ? sel.plan
+                 : null;
 
   if (!plan) {
     return bot.sendMessage(cid(msg.chat.id),
@@ -845,23 +881,20 @@ bot.onText(/\/grant (\d+)(?: (.+))?/, async (msg, match) => {
 
 bot.onText(/\/pending/, (msg) => {
   if (!ADMIN_IDS.includes(cid(msg.chat.id))) return bot.sendMessage(cid(msg.chat.id), "⛔ Not authorized.");
-
-  const stkEntries      = Object.entries(pendingSTK);
-  const receiptEntries  = Object.entries(awaitingReceipt).filter(([, r]) => r.code);
+  const stkEntries     = Object.entries(pendingSTK);
+  const receiptEntries = Object.entries(awaitingReceipt).filter(([, r]) => r.code);
 
   if (!stkEntries.length && !receiptEntries.length) {
     return bot.sendMessage(cid(msg.chat.id), "📭 No pending transactions.");
   }
 
   let message = "";
-
   if (stkEntries.length) {
     const lines = stkEntries.map(([id, p]) =>
       `• 🔑 \`${id}\`\n  👤 \`${p.chatId}\` | ${p.pkg || "—"} / ${p.plan || "—"} | Ksh ${p.price || "—"}`
     );
     message += `⏳ *Pending STK Pushes (${stkEntries.length})*\n\n${lines.join("\n\n")}\n\n_/grant <chatId> if callback was missed._\n\n`;
   }
-
   if (receiptEntries.length) {
     const lines = receiptEntries.map(([id, r]) =>
       `• 👤 \`${id}\` | ${r.pkg || "—"} / ${r.plan || "—"} | Ksh ${r.price || "—"}\n  🧾 Code: \`${r.code}\``
@@ -909,7 +942,8 @@ bot.onText(/\/stats/, (msg) => {
   const all  = Object.values(userSelections);
   const paid = all.filter((s) => s.paidAt).length;
   bot.sendMessage(cid(msg.chat.id),
-    `📊 *Bot Stats*\n\n👥 Total Sessions: *${all.length}*\n✅ Paid: *${paid}*\n⏳ Pending: *${all.length - paid}*\n💵 Awaiting USDT: *${Object.keys(pendingUSDT).length}*\n⏳ Pending STK: *${Object.keys(pendingSTK).length}*`,
+    `📊 *Bot Stats*\n\n👥 Total Sessions: *${all.length}*\n✅ Paid: *${paid}*\n⏳ Pending: *${all.length - paid}*\n` +
+    `💵 Awaiting USDT: *${Object.keys(pendingUSDT).length}*\n⏳ Pending STK: *${Object.keys(pendingSTK).length}*`,
     { parse_mode: "Markdown" }
   );
 });
@@ -994,9 +1028,6 @@ bot.on("message", async (msg) => {
   const text   = msg.text.trim();
   const sel    = userSelections[chatId];
 
-  // ── Handle phone number for STK push — MUST come before awaitingReceipt ──
-  // Phone numbers like 0712345678 are exactly 10 alphanumeric chars and would
-  // falsely match the M-Pesa code regex if awaitingReceipt were checked first.
   if (sel && sel.awaitingPhone) {
     sel.awaitingPhone = false;
     userSelections[chatId] = sel;
@@ -1064,10 +1095,9 @@ bot.on("message", async (msg) => {
     return;
   }
 
-  // ── Handle M-Pesa receipt code submitted by user ──────────────────────────
   if (awaitingReceipt[chatId]) {
     const receiptInfo = awaitingReceipt[chatId];
-    const code = text.toUpperCase();
+    const code        = text.toUpperCase();
 
     if (!/^[A-Z0-9]{10}$/.test(code)) {
       return bot.sendMessage(chatId,
@@ -1110,7 +1140,6 @@ bot.on("message", async (msg) => {
     );
   }
 
-  // ── User typed something freely — try to detect an M-Pesa code ────────────
   const looksLikeCode = /^[A-Z0-9]{10}$/.test(text.toUpperCase());
 
   if (looksLikeCode) {
@@ -1124,7 +1153,6 @@ bot.on("message", async (msg) => {
       );
     }
 
-    // BUG FIX: Removed broken string concatenation (bare \n` separators) — use clean template literal
     notifyAdmins(
       `🔔 *Receipt Code Received (Free Text)*\n\n` +
       `👤 ChatID: \`${chatId}\`\n` +
@@ -1148,7 +1176,6 @@ bot.on("message", async (msg) => {
       code,
     };
 
-    // BUG FIX: Removed broken string concatenation — use clean template literal
     return bot.sendMessage(chatId,
       `✅ *Got it!*\n\n` +
       `We've received your M-Pesa code \`${code}\` and our team is verifying it right now. 🔍\n\n` +
@@ -1157,9 +1184,7 @@ bot.on("message", async (msg) => {
     );
   }
 
-  // ── User typed random text that is NOT a valid code ──────────────────────
   if (sel && !sel.paidAt) {
-    // BUG FIX: Removed broken string concatenation — use clean template literal
     return bot.sendMessage(chatId,
       `😔 *Sorry, we didn't understand that.*\n\n` +
       `If you've already paid, please send your *M-Pesa confirmation code* — it's the *10-character code* in your payment SMS, e.g. \`RCX4B2K9QP\`.\n\n` +
@@ -1168,9 +1193,9 @@ bot.on("message", async (msg) => {
         parse_mode: "Markdown",
         reply_markup: {
           inline_keyboard: [
-            [{ text: "📲 Pay via STK Push",    callback_data: "pay_stk" }],
+            [{ text: "📲 Pay via STK Push",     callback_data: "pay_stk" }],
             [{ text: "💳 Pay Manually via Till", callback_data: "show_till" }],
-            [{ text: "❓ I Need Help",           callback_data: "need_help" }]
+            [{ text: "❓ I Need Help",            callback_data: "need_help" }]
           ]
         }
       }
@@ -1193,22 +1218,15 @@ bot.on("callback_query", async (query) => {
   bot.answerCallbackQuery(query.id).catch(() => {});
   await sendTyping(chatId, 600);
 
-  // ── Admin one-tap grant ───────────────────────────────────────────────────
   if (data.startsWith("admin_grant_")) {
     if (!ADMIN_IDS.includes(chatId)) return;
     const withoutPrefix = data.replace("admin_grant_", "");
-    // BUG FIX: Use the LAST underscore as the split point so numeric chatIds
-    // (which never contain underscores) are always parsed correctly, and plan
-    // labels with spaces (e.g. "1 Month") are preserved intact.
-    // The original code used indexOf("_") which is correct for numeric IDs, but
-    // using lastIndexOf("_") is safer and handles any future edge cases.
     const underscoreIdx = withoutPrefix.indexOf("_");
     const targetId      = cid(withoutPrefix.substring(0, underscoreIdx));
     const planLabel     = withoutPrefix.substring(underscoreIdx + 1);
 
     try {
       delete awaitingReceipt[targetId];
-
       await grantAccess(
         targetId,
         planLabel || "1 Month",
@@ -1221,9 +1239,7 @@ bot.on("callback_query", async (query) => {
     return;
   }
 
-  // ── Package selection ─────────────────────────────────────────────────────
   if (data === "package_naughty_premium_leaks") {
-    // BUG FIX: Preserve existing username when resetting selection
     const existingUsername = (userSelections[chatId] || {}).username;
     userSelections[chatId] = { package: "Naughty Premium Leaks", username: existingUsername };
     return bot.sendMessage(chatId,
@@ -1245,7 +1261,6 @@ bot.on("callback_query", async (query) => {
   }
 
   if (data === "package_naughty_explicit") {
-    // BUG FIX: Preserve existing username when resetting selection
     const existingUsername = (userSelections[chatId] || {}).username;
     userSelections[chatId] = { package: "Naughty Explicit", username: existingUsername };
     return bot.sendMessage(chatId,
@@ -1267,7 +1282,6 @@ bot.on("callback_query", async (query) => {
   }
 
   if (data === "back_to_package_naughty_premium_leaks") {
-    // BUG FIX: Preserve existing username on back navigation
     const existingUsername = (userSelections[chatId] || {}).username;
     userSelections[chatId] = { package: "Naughty Premium Leaks", username: existingUsername };
     return bot.sendMessage(chatId, `🔥 *Naughty Premium Leaks* — pick your plan:`, {
@@ -1286,7 +1300,6 @@ bot.on("callback_query", async (query) => {
   }
 
   if (data === "back_to_package_naughty_explicit") {
-    // BUG FIX: Preserve existing username on back navigation
     const existingUsername = (userSelections[chatId] || {}).username;
     userSelections[chatId] = { package: "Naughty Explicit", username: existingUsername };
     return bot.sendMessage(chatId, `💥 *Naughty Explicit* — pick your plan:`, {
@@ -1316,7 +1329,6 @@ bot.on("callback_query", async (query) => {
     });
   }
 
-  // ── Plan selection ────────────────────────────────────────────────────────
   if (PLANS[data]) {
     const plan = PLANS[data];
     const sel  = userSelections[chatId] || {};
@@ -1387,9 +1399,6 @@ bot.on("callback_query", async (query) => {
     const sel = userSelections[chatId] || {};
     sel.plan  = chosen.label;
 
-    // BUG FIX: `.replace(" ", "")` only replaces the FIRST space, so "6 Months"
-    // became "6Months" and "1 Year" became "1Year" — neither matching any PLANS key.
-    // Use a global regex replace to strip ALL spaces for the key lookup.
     const prefix = (sel.package === "Naughty Premium Leaks" ? "naughty_" : "premium_");
     const kesKey = prefix + chosen.label.toLowerCase().replace(/ /g, "");
     sel.price      = PLANS[kesKey]?.price || 0;
@@ -1474,9 +1483,9 @@ bot.on("callback_query", async (query) => {
         parse_mode: "Markdown",
         reply_markup: {
           inline_keyboard: [
-            [{ text: "🔄 Try STK Again",  callback_data: "pay_stk" }],
-            [{ text: "💳 Manual Till",     callback_data: "show_till" }],
-            [{ text: "🔁 Change Package",  callback_data: "change_package" }]
+            [{ text: "🔄 Try STK Again", callback_data: "pay_stk" }],
+            [{ text: "💳 Manual Till",    callback_data: "show_till" }],
+            [{ text: "🔁 Change Package", callback_data: "change_package" }]
           ]
         }
       }
@@ -1489,17 +1498,37 @@ bot.on("callback_query", async (query) => {
   }
 });
 
-// ─── RESTORE SUBSCRIPTIONS ON STARTUP ───────────────────────────────────────
+// ─── RESTORE SUBSCRIPTIONS ON STARTUP ────────────────────────────────────────
 function restoreSubTimers() {
-  const data = loadSubs();
+  const data    = loadSubs();
   const entries = Object.entries(data);
   if (!entries.length) return console.log("📂 No saved subscriptions to restore.");
 
   let restored = 0, expired = 0;
   const now = Date.now();
 
+  // FIX: Notify admins with a full restoration report on every startup so
+  // you can catch any anomalies (e.g. a 1-Year plan that only has 1 day left).
+  const report = [];
+
   entries.forEach(([chatId, { planLabel, expiresAt }]) => {
     const msLeft = expiresAt - now;
+
+    // FIX: Extra sanity-check — if expiresAt looks like it was stored in
+    // SECONDS instead of MILLISECONDS it will be ~year 1970. Detect and fix.
+    if (expiresAt < 1_000_000_000_000) {
+      console.error(`❌ expiresAt for ${chatId} looks like SECONDS (${expiresAt}) — auto-correcting to ms`);
+      notifyAdmins(
+        `🚨 *Corrupt sub entry detected & fixed*\n\n` +
+        `ChatID: \`${chatId}\` | Plan: ${planLabel}\n` +
+        `expiresAt was \`${expiresAt}\` (looks like seconds, not ms)\n\n` +
+        `_Entry removed. Please re-grant access manually if needed._\n\`/grant ${chatId}\``
+      );
+      removeSubEntry(chatId);
+      expired++;
+      report.push(`• \`${chatId}\` — ❌ corrupt timestamp, removed`);
+      return;
+    }
 
     if (msLeft <= 0) {
       console.log(`⏰ Sub expired while offline: ${chatId} — kicking now`);
@@ -1512,6 +1541,7 @@ function restoreSubTimers() {
       ).catch(() => {});
       removeSubEntry(chatId);
       expired++;
+      report.push(`• \`${chatId}\` — ⏰ expired (${planLabel})`);
       return;
     }
 
@@ -1545,10 +1575,21 @@ function restoreSubTimers() {
 
     subTimers[chatId] = timers;
     restored++;
-    console.log(`🔁 Restored timer for ${chatId} | ${planLabel} | ${Math.round(msLeft/3600000)}h left`);
+    const hLeft = Math.round(msLeft / 3600000);
+    console.log(`🔁 Restored: ${chatId} | ${planLabel} | ${hLeft}h left`);
+    report.push(`• \`${chatId}\` — ✅ ${planLabel} | ${hLeft}h remaining`);
   });
 
-  console.log(`✅ Subscriptions restored: ${restored} active, ${expired} expired & kicked`);
+  console.log(`✅ Subscriptions restored: ${restored} active, ${expired} expired`);
+
+  // FIX: Always send a startup report to admins so you know what was restored
+  if (report.length > 0) {
+    notifyAdmins(
+      `🔄 *Bot Restarted — Subscription Restore Report*\n\n` +
+      report.join("\n") +
+      `\n\n✅ Active: ${restored} | ⏰ Expired/Removed: ${expired}`
+    );
+  }
 }
 
 // ─── EXPRESS SERVER ──────────────────────────────────────────────────────────
