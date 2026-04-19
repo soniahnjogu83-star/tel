@@ -27,6 +27,17 @@ const BOT_TOKEN       = process.env.BOT_TOKEN;
 const RENDER_URL      = process.env.RENDER_EXTERNAL_URL
   || (CALLBACK_URL ? CALLBACK_URL.replace("/mpesa/callback", "") : null);
 
+function parseBooleanEnv(value, defaultValue = false) {
+  if (value === undefined || value === null) return defaultValue;
+  const normalized = String(value).trim().toLowerCase();
+  if (["false", "0", "no", "off"].includes(normalized)) return false;
+  if (["true", "1", "yes", "on"].includes(normalized)) return true;
+  return defaultValue;
+}
+
+let autoExpireSubscriptions = parseBooleanEnv(process.env.AUTO_EXPIRE_SUBSCRIPTIONS, true);
+let autoSendInvite = parseBooleanEnv(process.env.AUTO_SEND_INVITE, true);
+
 // ─── CHANNEL_ID ──────────────────────────────────────────────────────────────
 const CHANNEL_ID = -1001567081082;
 
@@ -228,28 +239,39 @@ async function grantAccess(rawChatId, planLabel, paymentSummary) {
 
     console.log(`⏱  Plan: ${resolvedLabel} | days: ${days} | durationMs: ${durationMs}`);
     console.log(`📅 Expires: ${new Date(expiresAtMs).toISOString()} (${expiresAtMs}ms)`);
-    console.log(`🔗 Creating invite link: CHANNEL_ID=${CHANNEL_ID}, expireDate=${inviteExpiry}`);
 
-    const inviteRes = await bot.createChatInviteLink(CHANNEL_ID, {
-      member_limit: 1,
-      expire_date:  inviteExpiry,
-      name:         `Access-${chatId}-${Date.now()}`
-    });
+    if (autoSendInvite) {
+      console.log(`🔗 Creating invite link: CHANNEL_ID=${CHANNEL_ID}, expireDate=${inviteExpiry}`);
 
-    const inviteLink = inviteRes.invite_link;
-    console.log(`✅ Invite link created: ${inviteLink}`);
+      const inviteRes = await bot.createChatInviteLink(CHANNEL_ID, {
+        member_limit: 1,
+        expire_date:  inviteExpiry,
+        name:         `Access-${chatId}-${Date.now()}`
+      });
 
-    await bot.sendMessage(chatId,
-      `🎉 *Access Granted!*\n\n` +
-      `${paymentSummary}\n\n` +
-      `👇 Tap the link below to join:\n${inviteLink}\n\n` +
-      `⚠️ *Important:*\n` +
-      `• This link is *single-use* — it works for you only\n` +
-      `• Once you join the channel, the link expires automatically\n` +
-      `• Your access expires in *${days} day(s)*\n\n` +
-      `_Welcome to the family!_ 🔐`,
-      { parse_mode: "Markdown", disable_web_page_preview: false }
-    );
+      const inviteLink = inviteRes.invite_link;
+      console.log(`✅ Invite link created: ${inviteLink}`);
+
+      await bot.sendMessage(chatId,
+        `🎉 *Access Granted!*\n\n` +
+        `${paymentSummary}\n\n` +
+        `👇 Tap the link below to join:\n${inviteLink}\n\n` +
+        `⚠️ *Important:*\n` +
+        `• This link is *single-use* — it works for you only\n` +
+        `• Once you join the channel, the link expires automatically\n` +
+        `• Your access expires in *${days} day(s)*\n\n` +
+        `_Welcome to the family!_ 🔐`,
+        { parse_mode: "Markdown", disable_web_page_preview: false }
+      );
+    } else {
+      console.log(`ℹ️ Auto-send invite disabled: access granted without immediate invite link for ${chatId}`);
+      await bot.sendMessage(chatId,
+        `🎉 *Payment confirmed!*\n\n` +
+        `${paymentSummary}\n\n` +
+        `✅ Your access is now active. An admin will send your invite link shortly.`,
+        { parse_mode: "Markdown" }
+      );
+    }
 
     clearSubTimers(chatId);
 
@@ -270,25 +292,29 @@ async function grantAccess(rawChatId, planLabel, paymentSummary) {
       }, warnMs);
     }
 
-    console.log(`⏰ Kick timer in ${Math.round(durationMs / 3600000)}h (${durationMs}ms)`);
-    timers.kickTimer = setTimeout(async () => {
-      try {
-        await bot.banChatMember(CHANNEL_ID, Number(chatId));
-        await bot.unbanChatMember(CHANNEL_ID, Number(chatId));
-        console.log(`🚪 User ${chatId} removed after plan expiry`);
-      } catch (e) {
-        console.error("Kick error:", e.message);
-      }
-      bot.sendMessage(chatId,
-        `👋 *Your access has ended.*\n\nYour *${resolvedLabel}* plan has expired. We hope you enjoyed your time with us! 🙏\n\nWhenever you're ready to come back, we'll be here 😊`,
-        {
-          parse_mode: "Markdown",
-          reply_markup: { inline_keyboard: [[{ text: "🔄 Re-subscribe", callback_data: "change_package" }]] }
+    if (autoExpireSubscriptions) {
+      console.log(`⏰ Kick timer in ${Math.round(durationMs / 3600000)}h (${durationMs}ms)`);
+      timers.kickTimer = setTimeout(async () => {
+        try {
+          await bot.banChatMember(CHANNEL_ID, Number(chatId));
+          await bot.unbanChatMember(CHANNEL_ID, Number(chatId));
+          console.log(`🚪 User ${chatId} removed after plan expiry`);
+        } catch (e) {
+          console.error("Kick error:", e.message);
         }
-      ).catch(() => {});
-      delete subTimers[chatId];
-      removeSubEntry(chatId);
-    }, durationMs);
+        bot.sendMessage(chatId,
+          `👋 *Your access has ended.*\n\nYour *${resolvedLabel}* plan has expired. We hope you enjoyed your time with us! 🙏\n\nWhenever you're ready to come back, we'll be here 😊`,
+          {
+            parse_mode: "Markdown",
+            reply_markup: { inline_keyboard: [[{ text: "🔄 Re-subscribe", callback_data: "change_package" }]] }
+          }
+        ).catch(() => {});
+        delete subTimers[chatId];
+        removeSubEntry(chatId);
+      }, durationMs);
+    } else {
+      console.log(`ℹ️ Auto-expire disabled: skipping kick timer for ${chatId}`);
+    }
 
     subTimers[chatId] = timers;
 
@@ -788,6 +814,40 @@ bot.onText(/\/testlink/, async (msg) => {
       { parse_mode: "Markdown" }
     );
   }
+});
+
+bot.onText(/\/config$/, (msg) => {
+  const chatId = cid(msg.chat.id);
+  if (!ADMIN_IDS.includes(chatId)) return bot.sendMessage(chatId, "⛔ Not authorized.");
+  bot.sendMessage(chatId,
+    `🔧 *Bot Configuration*\n\n` +
+    `• Auto-expire subscriptions: *${autoExpireSubscriptions ? "ON" : "OFF"}*\n` +
+    `• Auto-send invite links: *${autoSendInvite ? "ON" : "OFF"}*\n\n` +
+    `Change with:\n` +
+    `/autoexpire on|off\n` +
+    `/autoinvite on|off`,
+    { parse_mode: "Markdown" }
+  );
+});
+
+bot.onText(/\/autoexpire (on|off)/, (msg, match) => {
+  const chatId = cid(msg.chat.id);
+  if (!ADMIN_IDS.includes(chatId)) return bot.sendMessage(chatId, "⛔ Not authorized.");
+  autoExpireSubscriptions = match[1] === "on";
+  bot.sendMessage(chatId,
+    `✅ Auto-expire subscriptions is now *${autoExpireSubscriptions ? "ON" : "OFF"}*`,
+    { parse_mode: "Markdown" }
+  );
+});
+
+bot.onText(/\/autoinvite (on|off)/, (msg, match) => {
+  const chatId = cid(msg.chat.id);
+  if (!ADMIN_IDS.includes(chatId)) return bot.sendMessage(chatId, "⛔ Not authorized.");
+  autoSendInvite = match[1] === "on";
+  bot.sendMessage(chatId,
+    `✅ Auto-send invite links is now *${autoSendInvite ? "ON" : "OFF"}*`,
+    { parse_mode: "Markdown" }
+  );
 });
 
 bot.onText(/\/buy/, (msg) => {
@@ -1531,17 +1591,28 @@ function restoreSubTimers() {
     }
 
     if (msLeft <= 0) {
-      console.log(`⏰ Sub expired while offline: ${chatId} — kicking now`);
-      bot.banChatMember(CHANNEL_ID, Number(chatId))
-        .then(() => bot.unbanChatMember(CHANNEL_ID, Number(chatId)))
-        .catch(() => {});
-      bot.sendMessage(chatId,
-        `👋 *Your access has ended.*\n\nYour *${planLabel}* plan expired while we were briefly offline. We hope you enjoyed your time! 🙏\n\nReady to come back? Tap below 😊`,
-        { parse_mode: "Markdown", reply_markup: { inline_keyboard: [[{ text: "🔄 Re-subscribe", callback_data: "change_package" }]] } }
-      ).catch(() => {});
-      removeSubEntry(chatId);
-      expired++;
-      report.push(`• \`${chatId}\` — ⏰ expired (${planLabel})`);
+      if (autoExpireSubscriptions) {
+        console.log(`⏰ Sub expired while offline: ${chatId} — kicking now`);
+        bot.banChatMember(CHANNEL_ID, Number(chatId))
+          .then(() => bot.unbanChatMember(CHANNEL_ID, Number(chatId)))
+          .catch(() => {});
+        bot.sendMessage(chatId,
+          `👋 *Your access has ended.*\n\nYour *${planLabel}* plan expired while we were briefly offline. We hope you enjoyed your time! 🙏\n\nReady to come back? Tap below 😊`,
+          { parse_mode: "Markdown", reply_markup: { inline_keyboard: [[{ text: "🔄 Re-subscribe", callback_data: "change_package" }]] } }
+        ).catch(() => {});
+        removeSubEntry(chatId);
+        expired++;
+        report.push(`• \`${chatId}\` — ⏰ expired (${planLabel})`);
+      } else {
+        console.log(`ℹ️ Auto-expire disabled; expired subscription for ${chatId} will not be removed.`);
+        bot.sendMessage(chatId,
+          `⏳ *Your ${planLabel} plan ended while I was offline.*\n\n` +
+          `Automatic removal is currently disabled, so your membership remains active for now.`,
+          { parse_mode: "Markdown", reply_markup: { inline_keyboard: [[{ text: "🔄 Re-subscribe", callback_data: "change_package" }]] } }
+        ).catch(() => {});
+        restored++;
+        report.push(`• \`${chatId}\` — ⚠️ expired but auto-expire disabled`);
+      }
       return;
     }
 
