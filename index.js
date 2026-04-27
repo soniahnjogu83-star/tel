@@ -15,16 +15,9 @@ app.use(express.json());
 app.get("/", (req, res) => res.status(200).send("OK"));
 
 // ─── CONFIG ──────────────────────────────────────────────────────────────────
-const TILL_NUMBER     = process.env.TILL_NUMBER || "4902476";
-const TILL_NAME       = process.env.TILL_NAME || "ALJAKI Enterprise";
-const ADMIN_IDS_RAW   = process.env.ADMIN_IDS || "6954749470,5355760284";
-const DEFAULT_ADMIN_IDS = ["6954749470", "5355760284"];
-let ADMIN_IDS         = ADMIN_IDS_RAW.split(",")
-  .map((id) => id.trim())
-  .filter((id) => /^\d+$/.test(id));
-if (ADMIN_IDS.length === 0) {
-  ADMIN_IDS = [...DEFAULT_ADMIN_IDS];
-}
+const TILL_NUMBER     = "4902476";
+const TILL_NAME       = "ALJAKI Enterprise";
+const ADMIN_IDS       = ["6954749470", "5355760284"];
 const SHORTCODE       = process.env.SHORTCODE;
 const PASSKEY         = process.env.PASSKEY;
 const CONSUMER_KEY    = process.env.CONSUMER_KEY;
@@ -68,8 +61,6 @@ const USDT_PLANS = [
 ];
 
 // ─── STATE & UTILS ──────────────────────────────────────────────────────────
-const USDT_WALLET    = process.env.USDT_WALLET || "TU...your_wallet_address";
-const TRONGRID_KEY   = process.env.TRONGRID_KEY || "";
 const warnMs         = 24 * 60 * 60 * 1000; // 24 hours
 
 const userSelections = {};
@@ -133,7 +124,7 @@ pendingSTK = loadPendingSTK();
       `\n\n⚠️ Bot and/or STK Push will not work until these are set.`;
     console.error("❌ Missing env vars:", missing.join(", "));
     setTimeout(() => {
-      ADMIN_IDS.forEach((id) => safeSendMessage(id, msg, { parse_mode: "Markdown" }));
+      ADMIN_IDS.forEach((id) => bot.sendMessage(id, msg, { parse_mode: "Markdown" }).catch(() => {}));
     }, 5000);
   } else {
     console.log("✅ All required environment variables are present.");
@@ -395,7 +386,7 @@ async function grantAccess(rawChatId, planLabel, paymentSummary) {
       `*Please don't worry — you will not lose your access.* Our team has been notified and will send your link manually within a few minutes. 🙏\n\n` +
       `We sincerely apologize for the inconvenience. Thank you so much for your patience! 💛`,
       { parse_mode: "Markdown" }
-    ).catch((err) => logError('Ignored error', err));
+    ).catch(() => {});
   }
 }
 
@@ -410,6 +401,8 @@ function clearSubTimers(chatId) {
 }
 
 // ─── USDT CONFIG ─────────────────────────────────────────────────────────────
+const USDT_WALLET  = "TQQ7Y4PKNs2rMuN2AzHGc2k43MuyMvrjy9";
+const TRONGRID_KEY = "c2959dcd-5b2f-4742-939b-a61077a0f520";
 const pendingUSDT  = {};
 
 // ─── RATE LIMITING ──────────────────────────────────────────────────────────
@@ -549,7 +542,7 @@ function scheduleReminders(chatId) {
       safeSendMessage(id, text, {
         parse_mode: "Markdown",
         reply_markup: { inline_keyboard: keyboard }
-      }).catch((err) => logError('Ignored error', err));
+      }).catch(() => {});
     }, delay)
   );
   reminderTimers[id] = { timers };
@@ -578,7 +571,11 @@ async function stkPush(phone, amount, chatId) {
     const timestamp = moment().format("YYYYMMDDHHmmss");
     const password  = Buffer.from(`${SHORTCODE}${PASSKEY}${timestamp}`).toString("base64");
 
-    const normalized = validatePhone(phone);
+    let normalized = phone.trim().replace(/^\+/, "").replace(/^0/, "254");
+
+    if (!/^2547\d{8}$|^2541\d{8}$/.test(normalized)) {
+      throw new Error(`Invalid phone format: ${normalized}`);
+    }
 
     const payload = {
       BusinessShortCode: SHORTCODE,
@@ -614,7 +611,6 @@ async function stkPush(phone, amount, chatId) {
         ...entry,
         expiresAt: Date.now() + (10 * 60 * 1000)
       };
-      savePendingSTK(pendingSTK);
       console.log(`📌 Registered pending STK: ${res.data.CheckoutRequestID} →`, JSON.stringify(pendingSTK[res.data.CheckoutRequestID]));
     } else {
       console.warn(`⚠️ STK push non-zero ResponseCode: ${res.data.ResponseCode} — ${res.data.ResponseDescription}`);
@@ -837,7 +833,12 @@ bot.onText(/\/start/, async (msg) => {
   safeSendMessage(chatId,
     `Welcome ${username} 🚀\n\nSorry for any delay — I'm here now! Select your preferred package below:`,
     {
-      reply_markup: PACKAGE_KEYBOARD
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: "🔥 Naughty Premium Leaks",          callback_data: "package_naughty_premium_leaks" }],
+          [{ text: "💥 Naughty Explicit (Free Hookups)", callback_data: "package_naughty_explicit" }]
+        ]
+      }
     }
   );
 });
@@ -946,8 +947,8 @@ bot.onText(/\/send (\d+) ([\S]+)/, (msg, match) => {
         await removeUserFromChannel(targetId, "manual send expiry"); // Already using helper
         safeSendMessage(targetId,
           `👋 *Your access has ended.*\n\nYour *${sel.plan}* plan expired. Hope you enjoyed it! 🙏\n\nCome back anytime 😊`,
-          { parse_mode: "Markdown", reply_markup: getExpiryMessage(sel.plan).reply_markup }
-        );
+          { parse_mode: "Markdown", reply_markup: { inline_keyboard: [[{ text: "🔄 Re-subscribe", callback_data: "change_package" }]] } }
+        ).catch(() => {});
         delete subTimers[targetId];
         removeSubEntry(targetId);
       }, durationMs); // Use durationMs for clarity and consistency
@@ -1107,7 +1108,8 @@ bot.onText(/\/kick (\d+)/, async (msg, match) => {
   if (!ADMIN_IDS.includes(cid(msg.chat.id))) return safeSendMessage(cid(msg.chat.id), "⛔ Not authorized.");
   const targetId = cid(match[1]);
   try {
-    await removeUserFromChannel(targetId, "admin kick");
+    await bot.banChatMember(CHANNEL_ID, Number(targetId));
+    await bot.unbanChatMember(CHANNEL_ID, Number(targetId));
     clearSubTimers(targetId);
     safeSendMessage(targetId,
       `👋 *Your access has been removed.*\n\nWe hope you enjoyed your time! 🙏\n\nReady to come back? Tap below 😊`,
@@ -1239,7 +1241,7 @@ bot.on("message", async (msg) => {
       );
     }
 
-    setAwaitingReceipt(chatId, { ...receiptInfo, code });
+    awaitingReceipt[chatId] = { ...receiptInfo, code };
 
     notifyAdmins(
       `🔔 *Manual Receipt Submitted*\n\n` +
@@ -1296,12 +1298,12 @@ bot.on("message", async (msg) => {
       }
     );
 
-    setAwaitingReceipt(chatId, {
+    awaitingReceipt[chatId] = {
       plan:  sel2.plan    || "1 Month",
       pkg:   sel2.package || "N/A",
       price: sel2.price   || 0,
       code,
-    });
+    };
 
     // BUG FIX: Removed broken string concatenation — use clean template literal
     return safeSendMessage(chatId,
@@ -1336,7 +1338,7 @@ bot.on("message", async (msg) => {
     safeSendMessage(chatId,
       `👋 You're all set! If you need help tap below.`,
       { reply_markup: { inline_keyboard: [[{ text: "❓ I Need Help", callback_data: "need_help" }]] } }
-    ).catch((err) => logError('Ignored error', err));
+    ).catch(() => {});
   }
 });
 
@@ -1345,11 +1347,7 @@ bot.on("callback_query", async (query) => {
   const chatId = cid(query.message.chat.id);
   const data   = query.data;
 
-  if (isRateLimited(chatId)) {
-    return bot.answerCallbackQuery(query.id, { text: "⏳ Too many requests! Please wait a minute." }).catch(() => {});
-  }
-
-  bot.answerCallbackQuery(query.id).catch((err) => logError('Ignored error', err));
+  bot.answerCallbackQuery(query.id).catch(() => {});
   await sendTyping(chatId, 600);
 
   // ── Admin one-tap grant ───────────────────────────────────────────────────
@@ -1389,7 +1387,16 @@ bot.on("callback_query", async (query) => {
       `🔥 *Great choice!* Naughty Premium Leaks is our most popular package.\n\nPick your plan:`,
       {
         parse_mode: "Markdown",
-        reply_markup: getPlanKeyboard("Naughty Premium Leaks")
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: "1 Day — Ksh 40",                     callback_data: "naughty_1day" }],
+            [{ text: "1 Week — Ksh 170",                   callback_data: "naughty_1week" }],
+            [{ text: "2 Weeks — Ksh 270",                  callback_data: "naughty_2weeks" }],
+            [{ text: "1 Month — Ksh 450",                  callback_data: "naughty_1month" }],
+            [{ text: "6 Months — Ksh 2,500 🔥 Best Value", callback_data: "naughty_6months" }],
+            [{ text: "1 Year — Ksh 6,200 👑 VIP",          callback_data: "naughty_1year" }]
+          ]
+        }
       }
     );
   }
@@ -1402,7 +1409,16 @@ bot.on("callback_query", async (query) => {
       `💥 *You picked Naughty Explicit!* Free Hookups included.\n\nChoose your plan:`,
       {
         parse_mode: "Markdown",
-        reply_markup: getPlanKeyboard("Naughty Explicit")
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: "1 Day — Ksh 50",                     callback_data: "premium_1day" }],
+            [{ text: "1 Week — Ksh 220",                   callback_data: "premium_1week" }],
+            [{ text: "2 Weeks — Ksh 400",                  callback_data: "premium_2weeks" }],
+            [{ text: "1 Month — Ksh 680",                  callback_data: "premium_1month" }],
+            [{ text: "6 Months — Ksh 3,500 🔥 Best Value", callback_data: "premium_6months" }],
+            [{ text: "1 Year — Ksh 7,000 👑 VIP",          callback_data: "premium_1year" }]
+          ]
+        }
       }
     );
   }
@@ -1413,7 +1429,16 @@ bot.on("callback_query", async (query) => {
     userSelections[chatId] = { package: "Naughty Premium Leaks", username: existingUsername };
     return safeSendMessage(chatId, `🔥 *Naughty Premium Leaks* — pick your plan:`, {
       parse_mode: "Markdown",
-      reply_markup: getPlanKeyboard("Naughty Premium Leaks", true)
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: "1 Day — Ksh 40",                     callback_data: "naughty_1day" }],
+          [{ text: "1 Week — Ksh 170",                   callback_data: "naughty_1week" }],
+          [{ text: "2 Weeks — Ksh 270",                  callback_data: "naughty_2weeks" }],
+          [{ text: "1 Month — Ksh 450",                  callback_data: "naughty_1month" }],
+          [{ text: "6 Months — Ksh 2,500 🔥 Best Value", callback_data: "naughty_6months" }],
+          [{ text: "1 Year — Ksh 6,200 👑 VIP",          callback_data: "naughty_1year" }]
+        ]
+      }
     });
   }
 
@@ -1423,14 +1448,28 @@ bot.on("callback_query", async (query) => {
     userSelections[chatId] = { package: "Naughty Explicit", username: existingUsername };
     return safeSendMessage(chatId, `💥 *Naughty Explicit* — pick your plan:`, {
       parse_mode: "Markdown",
-      reply_markup: getPlanKeyboard("Naughty Explicit", true)
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: "1 Day — Ksh 50",                     callback_data: "premium_1day" }],
+          [{ text: "1 Week — Ksh 220",                   callback_data: "premium_1week" }],
+          [{ text: "2 Weeks — Ksh 400",                  callback_data: "premium_2weeks" }],
+          [{ text: "1 Month — Ksh 680",                  callback_data: "premium_1month" }],
+          [{ text: "6 Months — Ksh 3,500 🔥 Best Value", callback_data: "premium_6months" }],
+          [{ text: "1 Year — Ksh 7,000 👑 VIP",          callback_data: "premium_1year" }]
+        ]
+      }
     });
   }
 
   if (data === "change_package") {
     return safeSendMessage(chatId, `🔄 *Choose a package:*`, {
       parse_mode: "Markdown",
-      reply_markup: PACKAGE_KEYBOARD
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: "🔥 Naughty Premium Leaks",          callback_data: "package_naughty_premium_leaks" }],
+          [{ text: "💥 Naughty Explicit (Free Hookups)", callback_data: "package_naughty_explicit" }]
+        ]
+      }
     });
   }
 
@@ -1454,7 +1493,7 @@ bot.on("callback_query", async (query) => {
 
     return safeSendMessage(chatId,
       `✅ *${sel.package}* — *${plan.label}* selected\n💰 Ksh *${plan.price}*\n\nHow would you like to pay?`,
-      { parse_mode: "Markdown", reply_markup: getPaymentKeyboard(sel, backTarget) }
+      { parse_mode: "Markdown", reply_markup: { inline_keyboard: keyboard } }
     );
   }
 
@@ -1549,11 +1588,11 @@ bot.on("callback_query", async (query) => {
     const sel = userSelections[chatId];
     if (!sel || !sel.price) return safeSendMessage(chatId, "⚠️ Please start over with /start.");
 
-    setAwaitingReceipt(chatId, {
+    awaitingReceipt[chatId] = {
       plan:  sel.plan    || "1 Month",
       pkg:   sel.package || "N/A",
       price: sel.price   || 0,
-    });
+    };
 
     notifyAdmins(
       `🔔 *Payment Claim Received*\n\n👤 \`${chatId}\`\n📦 ${sel.package || "N/A"} — ${sel.plan || "N/A"}\n💰 Ksh ${sel.price}\n\n_Waiting for user to submit M-Pesa confirmation code..._`
@@ -1688,13 +1727,19 @@ function restoreSubTimers() {
     }
 
     timers.kickTimer = setTimeout(async () => {
-        await removeUserFromChannel(chatId, "restored expiry kick");
-        await safeSendMessage(chatId,
-          `👋 *Your access has ended.*\n\nYour *${planLabel}* plan has expired. We hope you enjoyed your time with us! 🙏\n\nWhenever you're ready to come back, we'll be here 😊`,
-          { parse_mode: "Markdown", reply_markup: getExpiryMessage(planLabel).reply_markup }
-        );
-        delete subTimers[chatId];
-        removeSubEntry(chatId);
+      try {
+        await bot.banChatMember(CHANNEL_ID, Number(chatId));
+        await bot.unbanChatMember(CHANNEL_ID, Number(chatId));
+        console.log(`🚪 User ${chatId} removed after plan expiry (restored timer)`);
+      } catch (e) {
+        console.error("Kick error:", e.message);
+      }
+      bot.sendMessage(chatId,
+        `👋 *Your access has ended.*\n\nYour *${planLabel}* plan has expired. We hope you enjoyed your time with us! 🙏\n\nWhenever you're ready to come back, we'll be here 😊`,
+        { parse_mode: "Markdown", reply_markup: { inline_keyboard: [[{ text: "🔄 Re-subscribe", callback_data: "change_package" }]] } }
+      ).catch(() => {});
+      delete subTimers[chatId];
+      removeSubEntry(chatId);
     }, msLeft);
 
     subTimers[chatId] = timers;
