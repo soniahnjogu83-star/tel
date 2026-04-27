@@ -61,7 +61,6 @@ const USDT_PLANS = [
 ];
 
 // ─── STATE & UTILS ──────────────────────────────────────────────────────────
-const TRONGRID_KEY   = process.env.TRONGRID_KEY || "";
 const warnMs         = 24 * 60 * 60 * 1000; // 24 hours
 
 const userSelections = {};
