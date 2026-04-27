@@ -61,7 +61,6 @@ const USDT_PLANS = [
 ];
 
 // ─── STATE & UTILS ──────────────────────────────────────────────────────────
-const USDT_WALLET    = process.env.USDT_WALLET || "TU...your_wallet_address";
 const TRONGRID_KEY   = process.env.TRONGRID_KEY || "";
 const warnMs         = 24 * 60 * 60 * 1000; // 24 hours
 
