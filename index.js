@@ -131,9 +131,11 @@ pendingSTK = loadPendingSTK();
   }
 })();
 
-// ─── SUBSCRIPTION PERSISTENCE ────────────────────────────────────────────────
-const SUBS_FILE = path.join(__dirname, "subscriptions.json");
+// ─── PERSISTENCE FILES ──────────────────────────────────────────────────────
+const SUBS_FILE       = path.join(__dirname, "subscriptions.json");
+const PENDING_STK_FILE = path.join(__dirname, "pending_stk.json");
 
+// ─── SUBSCRIPTION PERSISTENCE ────────────────────────────────────────────────
 function loadSubs() {
   try {
     if (fs.existsSync(SUBS_FILE)) {
@@ -154,8 +156,6 @@ function saveSubs(data) {
 }
 
 // ─── PENDING STK PERSISTENCE ─────────────────────────────────────────────────
-const PENDING_STK_FILE = path.join(__dirname, "pending_stk.json");
-
 function loadPendingSTK() {
   try {
     if (fs.existsSync(PENDING_STK_FILE)) {
@@ -325,7 +325,7 @@ async function grantAccess(rawChatId, planLabel, paymentSummary) {
     if (autoExpireSubscriptions) {
       clearSubTimers(chatId);
       const timers     = {};
-      timers.expiresAt = Date.now() + days * 86400 * 1000;
+      timers.expiresAt = expiresAtMs;
 
       if (days > 1) {
         timers.warnTimer = setTimeout(() => {
@@ -339,27 +339,27 @@ async function grantAccess(rawChatId, planLabel, paymentSummary) {
         }, warnMs);
       }
 
-      console.log(`⏰ Kick timer in ${Math.round(durationMs / 3600000)}h (${durationMs}ms)`);
-      timers.kickTimer = setTimeout(async () => {
-        try {
-          await removeUserFromChannel(chatId, "plan expiry"); // Use the helper function
-          console.log(`🚪 User ${chatId} removed after plan expiry`);
-        } catch (e) {
-          console.error("Kick error:", e.message);
+    console.log(`⏰ Kick timer in ${Math.round(durationMs / 3600000)}h (${durationMs}ms)`);
+    timers.kickTimer = setTimeout(async () => {
+      try {
+        await removeUserFromChannel(chatId, "plan expiry"); // Use the helper function
+        console.log(`🚪 User ${chatId} removed after plan expiry`);
+      } catch (e) {
+        console.error("Kick error:", e.message);
+      }
+      await safeSendMessage(chatId,
+        `👋 *Your access has ended.*\n\nYour *${resolvedLabel}* plan has expired. We hope you enjoyed your time with us! 🙏\n\nWhenever you're ready to come back, we'll be here 😊`,
+        {
+          parse_mode: "Markdown",
+          reply_markup: { inline_keyboard: [[{ text: "🔄 Re-subscribe", callback_data: "change_package" }]] }
         }
-        await safeSendMessage(chatId,
-          `👋 *Your access has ended.*\n\nYour *${resolvedLabel}* plan has expired. We hope you enjoyed your time with us! 🙏\n\nWhenever you're ready to come back, we'll be here 😊`,
-          {
-            parse_mode: "Markdown",
-            reply_markup: { inline_keyboard: [[{ text: "🔄 Re-subscribe", callback_data: "change_package" }]] }
-          }
-        );
-        delete subTimers[chatId];
-        removeSubEntry(chatId);
-      }, durationMs);
+      );
+      delete subTimers[chatId];
+      removeSubEntry(chatId);
+    }, durationMs);
 
-      subTimers[chatId] = timers;
-      saveSubEntry(chatId, resolvedLabel, timers.expiresAt);
+    subTimers[chatId] = timers;
+    saveSubEntry(chatId, resolvedLabel, expiresAtMs);
     }
     console.log(`✅ Access fully set up for ${chatId} | ${resolvedLabel} | ${days}d`);
 
@@ -401,8 +401,8 @@ function clearSubTimers(chatId) {
 }
 
 // ─── USDT CONFIG ─────────────────────────────────────────────────────────────
-const USDT_WALLET  = "TQQ7Y4PKNs2rMuN2AzHGc2k43MuyMvrjy9";
-const TRONGRID_KEY = "c2959dcd-5b2f-4742-939b-a61077a0f520";
+const USDT_WALLET    = process.env.USDT_WALLET || "TU...your_wallet_address";
+const TRONGRID_KEY   = process.env.TRONGRID_KEY || "";
 const pendingUSDT  = {};
 
 // ─── RATE LIMITING ──────────────────────────────────────────────────────────
@@ -932,9 +932,11 @@ bot.onText(/\/send (\d+) ([\S]+)/, (msg, match) => {
     if (sel.plan && autoExpireSubscriptions) {
       const days = PLAN_DAYS[sel.plan] || 30;
       const durationMs = days * 86400000;
+      const nowMs = Date.now();
+      const expiresAtMs = nowMs + durationMs;
       clearSubTimers(targetId);
       const timers     = {};
-      timers.expiresAt = Date.now() + days * 86400 * 1000;
+      timers.expiresAt = expiresAtMs;
       if (days > 1) {
         timers.warnTimer = setTimeout(() => {
           safeSendMessage(targetId,
@@ -954,7 +956,7 @@ bot.onText(/\/send (\d+) ([\S]+)/, (msg, match) => {
       }, durationMs); // Use durationMs for clarity and consistency
       subTimers[targetId] = timers;
       // BUG FIX: persist the subscription so restoreSubTimers can recover it
-      saveSubEntry(targetId, sel.plan, timers.expiresAt);
+      saveSubEntry(targetId, sel.plan, expiresAtMs);
     } // Already using helper
   }).catch((err) => safeSendMessage(cid(msg.chat.id), `❌ Failed: ${err.message}`));
 });
