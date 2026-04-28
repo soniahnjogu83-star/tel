@@ -64,7 +64,7 @@ const USDT_PLANS = [
 const warnMs         = 24 * 60 * 60 * 1000; // 24 hours
 
 const userSelections = {};
-const pendingSTK     = {};
+let pendingSTK        = {};
 const awaitingReceipt = {};
 const reminderTimers  = {};
 const subTimers       = {};
@@ -107,6 +107,9 @@ bot.on("polling_error", (err) => {
   }
 });
 
+// ─── LOAD PERSISTED DATA ────────────────────────────────────────────────────
+pendingSTK = loadPendingSTK();
+
 // ─── EARLY ENV VALIDATION ────────────────────────────────────────────────────
 (function validateEnv() {
   const required = {
@@ -128,9 +131,11 @@ bot.on("polling_error", (err) => {
   }
 })();
 
-// ─── SUBSCRIPTION PERSISTENCE ────────────────────────────────────────────────
-const SUBS_FILE = path.join(__dirname, "subscriptions.json");
+// ─── PERSISTENCE FILES ──────────────────────────────────────────────────────
+const SUBS_FILE       = path.join(__dirname, "subscriptions.json");
+const PENDING_STK_FILE = path.join(__dirname, "pending_stk.json");
 
+// ─── SUBSCRIPTION PERSISTENCE ────────────────────────────────────────────────
 function loadSubs() {
   try {
     if (fs.existsSync(SUBS_FILE)) {
@@ -147,6 +152,32 @@ function saveSubs(data) {
     fs.writeFileSync(SUBS_FILE, JSON.stringify(data, null, 2));
   } catch (e) {
     console.error("⚠️ Could not save subscriptions.json:", e.message);
+  }
+}
+
+// ─── PENDING STK PERSISTENCE ─────────────────────────────────────────────────
+function loadPendingSTK() {
+  try {
+    if (fs.existsSync(PENDING_STK_FILE)) {
+      const data = JSON.parse(fs.readFileSync(PENDING_STK_FILE, "utf8"));
+      // Convert back to Map-like object
+      const restored = {};
+      for (const [key, value] of Object.entries(data)) {
+        restored[key] = value;
+      }
+      return restored;
+    }
+  } catch (e) {
+    console.error("⚠️ Could not load pending_stk.json:", e.message);
+  }
+  return {};
+}
+
+function savePendingSTK(data) {
+  try {
+    fs.writeFileSync(PENDING_STK_FILE, JSON.stringify(data, null, 2));
+  } catch (e) {
+    console.error("⚠️ Could not save pending_stk.json:", e.message);
   }
 }
 
@@ -291,21 +322,22 @@ async function grantAccess(rawChatId, planLabel, paymentSummary) {
       );
     }
 
-    clearSubTimers(chatId);
-    const timers     = {};
-    timers.expiresAt = Date.now() + days * 86400 * 1000;
+    if (autoExpireSubscriptions) {
+      clearSubTimers(chatId);
+      const timers     = {};
+      timers.expiresAt = expiresAtMs;
 
-    if (days > 1) {
-      timers.warnTimer = setTimeout(() => {
-        safeSendMessage(chatId,
-          `⏰ *Heads up!*\n\nYour *${resolvedLabel}* access expires in *24 hours*.\n\nRenew now to stay connected 😊`,
-          {
-            parse_mode: "Markdown",
-            reply_markup: { inline_keyboard: [[{ text: "🔄 Renew My Access", callback_data: "change_package" }]] }
-          }
-        );
-      }, warnMs);
-    }
+      if (days > 1) {
+        timers.warnTimer = setTimeout(() => {
+          safeSendMessage(chatId,
+            `⏰ *Heads up!*\n\nYour *${resolvedLabel}* access expires in *24 hours*.\n\nRenew now to stay connected 😊`,
+            {
+              parse_mode: "Markdown",
+              reply_markup: { inline_keyboard: [[{ text: "🔄 Renew My Access", callback_data: "change_package" }]] }
+            }
+          );
+        }, warnMs);
+      }
 
     console.log(`⏰ Kick timer in ${Math.round(durationMs / 3600000)}h (${durationMs}ms)`);
     timers.kickTimer = setTimeout(async () => {
@@ -327,7 +359,8 @@ async function grantAccess(rawChatId, planLabel, paymentSummary) {
     }, durationMs);
 
     subTimers[chatId] = timers;
-    saveSubEntry(chatId, resolvedLabel, timers.expiresAt);
+    saveSubEntry(chatId, resolvedLabel, expiresAtMs);
+    }
     console.log(`✅ Access fully set up for ${chatId} | ${resolvedLabel} | ${days}d`);
 
   } catch (err) {
@@ -368,8 +401,8 @@ function clearSubTimers(chatId) {
 }
 
 // ─── USDT CONFIG ─────────────────────────────────────────────────────────────
-const USDT_WALLET  = "TQQ7Y4PKNs2rMuN2AzHGc2k43MuyMvrjy9";
-const TRONGRID_KEY = "c2959dcd-5b2f-4742-939b-a61077a0f520";
+const USDT_WALLET    = process.env.USDT_WALLET || "TU...your_wallet_address";
+const TRONGRID_KEY   = process.env.TRONGRID_KEY || "";
 const pendingUSDT  = {};
 
 // ─── RATE LIMITING ──────────────────────────────────────────────────────────
@@ -574,8 +607,11 @@ async function stkPush(phone, amount, chatId) {
         price:    sel.price   || amount,
         username: sel.username || id,
       };
-      pendingSTK[res.data.CheckoutRequestID] = entry;
-      console.log(`📌 Registered pending STK: ${res.data.CheckoutRequestID} →`, JSON.stringify(entry));
+      pendingSTK[res.data.CheckoutRequestID] = {
+        ...entry,
+        expiresAt: Date.now() + (10 * 60 * 1000)
+      };
+      console.log(`📌 Registered pending STK: ${res.data.CheckoutRequestID} →`, JSON.stringify(pendingSTK[res.data.CheckoutRequestID]));
     } else {
       console.warn(`⚠️ STK push non-zero ResponseCode: ${res.data.ResponseCode} — ${res.data.ResponseDescription}`);
     }
@@ -614,6 +650,7 @@ app.post("/mpesa/callback", (req, res) => {
     }
 
     delete pendingSTK[checkId];
+    savePendingSTK(pendingSTK);
     const { chatId, plan, pkg, price, username } = pending;
     const id = cid(chatId);
     console.log(`✅ Matched pending STK: chatId=${id}, plan=${plan}, pkg=${pkg}`);
@@ -892,12 +929,14 @@ bot.onText(/\/send (\d+) ([\S]+)/, (msg, match) => {
     { parse_mode: "Markdown" }
   ).then(() => {
     safeSendMessage(cid(msg.chat.id), `✅ Access link sent to \`${targetId}\``, { parse_mode: "Markdown" });
-    if (sel.plan) {
+    if (sel.plan && autoExpireSubscriptions) {
       const days = PLAN_DAYS[sel.plan] || 30;
       const durationMs = days * 86400000;
+      const nowMs = Date.now();
+      const expiresAtMs = nowMs + durationMs;
       clearSubTimers(targetId);
       const timers     = {};
-      timers.expiresAt = Date.now() + days * 86400 * 1000;
+      timers.expiresAt = expiresAtMs;
       if (days > 1) {
         timers.warnTimer = setTimeout(() => {
           safeSendMessage(targetId,
@@ -917,7 +956,7 @@ bot.onText(/\/send (\d+) ([\S]+)/, (msg, match) => {
       }, durationMs); // Use durationMs for clarity and consistency
       subTimers[targetId] = timers;
       // BUG FIX: persist the subscription so restoreSubTimers can recover it
-      saveSubEntry(targetId, sel.plan, timers.expiresAt);
+      saveSubEntry(targetId, sel.plan, expiresAtMs);
     } // Already using helper
   }).catch((err) => safeSendMessage(cid(msg.chat.id), `❌ Failed: ${err.message}`));
 });
@@ -1717,9 +1756,14 @@ function restoreSubTimers() {
 setInterval(() => {
   const now = Date.now();
   // Cleanup stale STK pushes (older than 10 mins)
+  let stkChanged = false;
   for (const cid in pendingSTK) {
-    if (pendingSTK[cid].expiresAt < now) delete pendingSTK[cid];
+    if (pendingSTK[cid].expiresAt < now) {
+      delete pendingSTK[cid];
+      stkChanged = true;
+    }
   }
+  if (stkChanged) savePendingSTK(pendingSTK);
   // Cleanup stale USDT pollers
   for (const cid in pendingUSDT) {
     if (pendingUSDT[cid].expiresAt < now) stopUsdtPoller(cid);
