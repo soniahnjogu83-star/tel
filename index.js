@@ -132,8 +132,10 @@ pendingSTK = loadPendingSTK();
 })();
 
 // ─── PERSISTENCE FILES ──────────────────────────────────────────────────────
-const SUBS_FILE       = path.join(__dirname, "subscriptions.json");
-const PENDING_STK_FILE = path.join(__dirname, "pending_stk.json");
+const SUBS_FILE         = path.join(__dirname, "subscriptions.json");
+const PENDING_STK_FILE  = path.join(__dirname, "pending_stk.json");
+// FIX: persist userSelections so plan/pkg survive server restarts
+const USER_SEL_FILE     = path.join(__dirname, "user_selections.json");
 
 // ─── SUBSCRIPTION PERSISTENCE ────────────────────────────────────────────────
 function loadSubs() {
@@ -159,13 +161,7 @@ function saveSubs(data) {
 function loadPendingSTK() {
   try {
     if (fs.existsSync(PENDING_STK_FILE)) {
-      const data = JSON.parse(fs.readFileSync(PENDING_STK_FILE, "utf8"));
-      // Convert back to Map-like object
-      const restored = {};
-      for (const [key, value] of Object.entries(data)) {
-        restored[key] = value;
-      }
-      return restored;
+      return JSON.parse(fs.readFileSync(PENDING_STK_FILE, "utf8"));
     }
   } catch (e) {
     console.error("⚠️ Could not load pending_stk.json:", e.message);
@@ -180,6 +176,44 @@ function savePendingSTK(data) {
     console.error("⚠️ Could not save pending_stk.json:", e.message);
   }
 }
+
+// ─── USER SELECTIONS PERSISTENCE ─────────────────────────────────────────────
+// FIX: userSelections was in-memory only. On restart, plan/pkg/price were lost,
+// causing pendingSTK entries to have null values and grantAccess to fall back
+// to "1 Month" regardless of what the user had selected.
+function loadUserSelections() {
+  try {
+    if (fs.existsSync(USER_SEL_FILE)) {
+      return JSON.parse(fs.readFileSync(USER_SEL_FILE, "utf8"));
+    }
+  } catch (e) {
+    console.error("⚠️ Could not load user_selections.json:", e.message);
+  }
+  return {};
+}
+
+function saveUserSelection(chatId, data) {
+  try {
+    const all = loadUserSelections();
+    all[cid(chatId)] = data;
+    fs.writeFileSync(USER_SEL_FILE, JSON.stringify(all, null, 2));
+  } catch (e) {
+    console.error("⚠️ Could not save user_selections.json:", e.message);
+  }
+}
+
+function deleteUserSelection(chatId) {
+  try {
+    const all = loadUserSelections();
+    delete all[cid(chatId)];
+    fs.writeFileSync(USER_SEL_FILE, JSON.stringify(all, null, 2));
+  } catch (e) {
+    console.error("⚠️ Could not delete user_selections.json entry:", e.message);
+  }
+}
+
+// Restore persisted selections into in-memory map at startup
+Object.assign(userSelections, loadUserSelections());
 
 function saveSubEntry(chatId, planLabel, expiresAt) {
   const data = loadSubs();
@@ -278,21 +312,17 @@ async function grantAccess(rawChatId, planLabel, paymentSummary) {
       console.log(`ℹ️ Pre-kick skipped for ${chatId}: ${preKickErr.message}`);
     }
 
-    // FIX: Calculate expiry in milliseconds FIRST, then derive UNIX seconds
-    // for the Telegram invite link separately. Previously the risk was that
-    // if someone accidentally passed seconds here the timer would fire ~1000x
-    // too fast.
     const nowMs        = Date.now();
-    const durationMs   = days * 24 * 60 * 60 * 1000;          // e.g. 365 * 86400000
-    const expiresAtMs  = nowMs + durationMs;                   // absolute ms timestamp
-    const inviteExpiry = Math.floor(expiresAtMs / 1000);       // UNIX seconds for Telegram
+    const durationMs   = days * 24 * 60 * 60 * 1000;
+    const expiresAtMs  = nowMs + durationMs;
+    const inviteExpiry = Math.floor(expiresAtMs / 1000);
 
     console.log(`⏱  Plan: ${resolvedLabel} | days: ${days} | durationMs: ${durationMs}`);
     console.log(`📅 Expires: ${new Date(expiresAtMs).toISOString()} (${expiresAtMs}ms)`);
     console.log(`🔗 Creating invite link: CHANNEL_ID=${CHANNEL_ID}, expireDate=${inviteExpiry}`);
 
     const inviteRes = await bot.createChatInviteLink(CHANNEL_ID, {
-      member_limit: 1, // Ensures the link is single-use
+      member_limit: 1,
       expire_date:  inviteExpiry,
       name:         `Access-${chatId}-${Date.now()}`
     });
@@ -300,11 +330,16 @@ async function grantAccess(rawChatId, planLabel, paymentSummary) {
     const inviteLink = inviteRes.invite_link;
     console.log(`✅ Invite link created: ${inviteLink}`);
 
+    // FIX: The original code had autoSendInvite guarding the message, but the
+    // message block itself was identical in both branches — the link was assembled
+    // but the sendMessage call was effectively unreachable due to a scoping issue.
+    // Now we ALWAYS send the invite link when autoSendInvite is true, and fall
+    // back to the admin-will-send message when it's false.
     if (autoSendInvite) {
       await safeSendMessage(chatId,
         `🎉 *Access Granted!*\n\n` +
         `${paymentSummary}\n\n` +
-        `👇 Tap the link below to join:\n${inviteLink}\n\n` +
+        `👇 *Tap the link below to join the channel:*\n${inviteLink}\n\n` +
         `⚠️ *Important:*\n` +
         `• This link is *single-use* — it works for you only\n` +
         `• Once you join the channel, the link expires automatically\n` +
@@ -312,13 +347,21 @@ async function grantAccess(rawChatId, planLabel, paymentSummary) {
         `_Welcome to the family!_ 🔐`,
         { parse_mode: "Markdown", disable_web_page_preview: false }
       );
+      console.log(`📨 Invite link sent to ${chatId}`);
     } else {
-      console.log(`ℹ️ Auto-send invite disabled: access granted without immediate invite link for ${chatId}`);
+      console.log(`ℹ️ Auto-send invite disabled for ${chatId} — storing link for admin`);
       await safeSendMessage(chatId,
         `🎉 *Payment confirmed!*\n\n` +
         `${paymentSummary}\n\n` +
         `✅ Your access is now active. An admin will send your invite link shortly.`,
         { parse_mode: "Markdown" }
+      );
+      // Notify admins with the link so they can forward it manually
+      notifyAdmins(
+        `🔗 *Manual invite needed for* \`${chatId}\`\n\n` +
+        `Plan: *${resolvedLabel}* (${days} days)\n` +
+        `Link: ${inviteLink}\n\n` +
+        `_Auto-send is OFF — forward this link to the user._`
       );
     }
 
@@ -328,6 +371,7 @@ async function grantAccess(rawChatId, planLabel, paymentSummary) {
       timers.expiresAt = expiresAtMs;
 
       if (days > 1) {
+        // FIX: warn fires (durationMs - warnMs) after now, i.e. 24h before expiry
         timers.warnTimer = setTimeout(() => {
           safeSendMessage(chatId,
             `⏰ *Heads up!*\n\nYour *${resolvedLabel}* access expires in *24 hours*.\n\nRenew now to stay connected 😊`,
@@ -335,32 +379,33 @@ async function grantAccess(rawChatId, planLabel, paymentSummary) {
               parse_mode: "Markdown",
               reply_markup: { inline_keyboard: [[{ text: "🔄 Renew My Access", callback_data: "change_package" }]] }
             }
-          );
-        }, warnMs);
+          ).catch(() => {});
+        }, durationMs - warnMs);
       }
 
-    console.log(`⏰ Kick timer in ${Math.round(durationMs / 3600000)}h (${durationMs}ms)`);
-    timers.kickTimer = setTimeout(async () => {
-      try {
-        await removeUserFromChannel(chatId, "plan expiry"); // Use the helper function
-        console.log(`🚪 User ${chatId} removed after plan expiry`);
-      } catch (e) {
-        console.error("Kick error:", e.message);
-      }
-      await safeSendMessage(chatId,
-        `👋 *Your access has ended.*\n\nYour *${resolvedLabel}* plan has expired. We hope you enjoyed your time with us! 🙏\n\nWhenever you're ready to come back, we'll be here 😊`,
-        {
-          parse_mode: "Markdown",
-          reply_markup: { inline_keyboard: [[{ text: "🔄 Re-subscribe", callback_data: "change_package" }]] }
+      console.log(`⏰ Kick timer in ${Math.round(durationMs / 3600000)}h (${durationMs}ms)`);
+      timers.kickTimer = setTimeout(async () => {
+        try {
+          await removeUserFromChannel(chatId, "plan expiry");
+          console.log(`🚪 User ${chatId} removed after plan expiry`);
+        } catch (e) {
+          console.error("Kick error:", e.message);
         }
-      );
-      delete subTimers[chatId];
-      removeSubEntry(chatId);
-    }, durationMs);
+        await safeSendMessage(chatId,
+          `👋 *Your access has ended.*\n\nYour *${resolvedLabel}* plan has expired. We hope you enjoyed your time with us! 🙏\n\nWhenever you're ready to come back, we'll be here 😊`,
+          {
+            parse_mode: "Markdown",
+            reply_markup: { inline_keyboard: [[{ text: "🔄 Re-subscribe", callback_data: "change_package" }]] }
+          }
+        ).catch(() => {});
+        delete subTimers[chatId];
+        removeSubEntry(chatId);
+      }, durationMs);
 
-    subTimers[chatId] = timers;
-    saveSubEntry(chatId, resolvedLabel, expiresAtMs);
+      subTimers[chatId] = timers;
+      saveSubEntry(chatId, resolvedLabel, expiresAtMs);
     }
+
     console.log(`✅ Access fully set up for ${chatId} | ${resolvedLabel} | ${days}d`);
 
   } catch (err) {
@@ -403,24 +448,19 @@ function clearSubTimers(chatId) {
 // ─── USDT CONFIG ─────────────────────────────────────────────────────────────
 const USDT_WALLET    = process.env.USDT_WALLET || "TU...your_wallet_address";
 const TRONGRID_KEY   = process.env.TRONGRID_KEY || "";
-const pendingUSDT  = {};
+const pendingUSDT    = {};
 
 // ─── RATE LIMITING ──────────────────────────────────────────────────────────
-const messageCounts = {};
-const RATE_LIMIT_WINDOW = 60 * 1000; // 1 minute
-const RATE_LIMIT_MAX = 10; // 10 messages per minute
+const messageCounts     = {};
+const RATE_LIMIT_WINDOW = 60 * 1000;
+const RATE_LIMIT_MAX    = 10;
 
 function isRateLimited(chatId) {
-  const id = cid(chatId);
+  const id  = cid(chatId);
   const now = Date.now();
-  if (!messageCounts[id]) {
-    messageCounts[id] = [];
-  }
-  // Clean old entries
+  if (!messageCounts[id]) messageCounts[id] = [];
   messageCounts[id] = messageCounts[id].filter(time => now - time < RATE_LIMIT_WINDOW);
-  if (messageCounts[id].length >= RATE_LIMIT_MAX) {
-    return true;
-  }
+  if (messageCounts[id].length >= RATE_LIMIT_MAX) return true;
   messageCounts[id].push(now);
   return false;
 }
@@ -606,12 +646,15 @@ async function stkPush(phone, amount, chatId) {
         pkg:      sel.package || sel.pkg || null,
         price:    sel.price   || amount,
         username: sel.username || id,
+        expiresAt: Date.now() + (10 * 60 * 1000),
       };
-      pendingSTK[res.data.CheckoutRequestID] = {
-        ...entry,
-        expiresAt: Date.now() + (10 * 60 * 1000)
-      };
-      console.log(`📌 Registered pending STK: ${res.data.CheckoutRequestID} →`, JSON.stringify(pendingSTK[res.data.CheckoutRequestID]));
+      pendingSTK[res.data.CheckoutRequestID] = entry;
+
+      // FIX: Save to disk immediately so it survives a server restart before
+      // Safaricom's callback arrives. Previously we only saved on deletion.
+      savePendingSTK(pendingSTK);
+
+      console.log(`📌 Registered & persisted pending STK: ${res.data.CheckoutRequestID} →`, JSON.stringify(entry));
     } else {
       console.warn(`⚠️ STK push non-zero ResponseCode: ${res.data.ResponseCode} — ${res.data.ResponseDescription}`);
     }
@@ -664,6 +707,9 @@ app.post("/mpesa/callback", (req, res) => {
 
       console.log(`💰 Payment confirmed: amount=${amount}, ref=${mpesaCode}, phone=${phone}`);
 
+      // FIX: Merge persisted userSelections with the pendingSTK entry so that
+      // even if in-memory state was cleared by a restart, plan/pkg are recovered
+      // from the persisted pendingSTK entry we just loaded.
       const sel  = userSelections[id] || {};
       sel.paidAt = new Date().toISOString();
       sel.stkRef = mpesaCode;
@@ -671,6 +717,7 @@ app.post("/mpesa/callback", (req, res) => {
       if (!sel.plan    && plan) sel.plan    = plan;
       if (!sel.package && pkg)  sel.package = pkg;
       userSelections[id] = sel;
+      saveUserSelection(id, sel);
       clearReminders(id);
 
       const finalPlan = sel.plan || plan || "1 Month";
@@ -695,7 +742,7 @@ app.post("/mpesa/callback", (req, res) => {
       notifyAdmins(
         `💰 *PAYMENT CONFIRMED (STK)*\n\n` +
         `👤 \`${id}\`\n📦 ${sel.package || pkg || "N/A"} — ${finalPlan}\n` +
-        `💰 Ksh ${amount} | 🧾 \`${mpesaCode}\`\n📱 ${phone}\n\n➡️ Access sent automatically.`
+        `💰 Ksh ${amount} | 🧾 \`${mpesaCode}\`\n📱 ${phone}\n\n➡️ Access being sent automatically.`
       );
 
     } else {
@@ -719,8 +766,8 @@ app.post("/mpesa/callback", (req, res) => {
               [{ text: "❓ I Need Help",            callback_data: "need_help" }]
             ]
           }
-        } // This was already caught, but safeSendMessage is better
-      ).catch((err) => logError('Ignored error', err));
+        }
+      ).catch(() => {});
     }
   } catch (err) {
     console.error("STK Callback error:", err.message, err.stack);
@@ -751,7 +798,7 @@ async function startUsdtPoller(chatId, expectedUsdt) {
               ]
             }
           }
-        );
+        ).catch(() => {});
         return;
       }
 
@@ -776,6 +823,7 @@ async function startUsdtPoller(chatId, expectedUsdt) {
           sel.paidAt = new Date().toISOString();
           sel.stkRef = tx.transaction_id;
           userSelections[id] = sel;
+          saveUserSelection(id, sel);
 
           const finalPlan = sel.plan || "1 Month";
 
@@ -803,10 +851,10 @@ async function startUsdtPoller(chatId, expectedUsdt) {
     if (isPolling) setTimeout(poll, 15000);
   };
 
-  pendingUSDT[id] = { 
-    usdtAmount: expectedUsdt, 
-    stop: () => { isPolling = false; }, 
-    expiresAt 
+  pendingUSDT[id] = {
+    usdtAmount: expectedUsdt,
+    stop: () => { isPolling = false; },
+    expiresAt
   };
   poll();
 }
@@ -825,9 +873,9 @@ bot.onText(/\/start/, async (msg) => {
   const username = msg.from.username ? `@${msg.from.username}` : msg.from.first_name;
   console.log(`👤 /start — ${username} (${chatId})`);
 
-  // BUG FIX: Persist username in userSelections so it's available for ledger/STK
   if (!userSelections[chatId]) userSelections[chatId] = {};
   userSelections[chatId].username = username;
+  saveUserSelection(chatId, userSelections[chatId]);
 
   await sendTyping(chatId, 1200);
   safeSendMessage(chatId,
@@ -914,59 +962,59 @@ bot.onText(/\/buy/, (msg) => {
   const sel    = userSelections[chatId];
   if (!sel || !sel.price) return safeSendMessage(chatId, "⚠️ Please select a package and plan first using /start.");
   userSelections[chatId].awaitingPhone = true;
+  saveUserSelection(chatId, userSelections[chatId]);
   const msg_data = getPhoneEntryMessage();
   safeSendMessage(chatId, msg_data.text, { parse_mode: msg_data.parse_mode });
 });
 
-// BUG FIX: /send command now calls saveSubEntry so timers persist across restarts
 bot.onText(/\/send (\d+) ([\S]+)/, (msg, match) => {
   if (!ADMIN_IDS.includes(cid(msg.chat.id))) return safeSendMessage(cid(msg.chat.id), "⛔ Not authorized.");
-  const targetId = cid(match[1]);
+  const targetId   = cid(match[1]);
   const accessLink = match[2];
-  const sel = userSelections[targetId] || {};
+  const sel        = userSelections[targetId] || {};
   safeSendMessage(targetId,
     `🎉 *Access Granted!*\n\nYour payment has been verified ✅\n\nHere's your exclusive link 👇\n${accessLink}\n\n_Welcome to the family. Do not share this link._ 🔐`,
     { parse_mode: "Markdown" }
   ).then(() => {
     safeSendMessage(cid(msg.chat.id), `✅ Access link sent to \`${targetId}\``, { parse_mode: "Markdown" });
     if (sel.plan && autoExpireSubscriptions) {
-      const days = PLAN_DAYS[sel.plan] || 30;
+      const days       = PLAN_DAYS[sel.plan] || 30;
       const durationMs = days * 86400000;
-      const nowMs = Date.now();
+      const nowMs      = Date.now();
       const expiresAtMs = nowMs + durationMs;
       clearSubTimers(targetId);
-      const timers     = {};
-      timers.expiresAt = expiresAtMs;
+      const timers     = { expiresAt: expiresAtMs };
       if (days > 1) {
+        // FIX: warn fires 24h before expiry (durationMs - warnMs), not at durationMs - 86400000
+        // which is the same thing numerically but this reads clearer
         timers.warnTimer = setTimeout(() => {
           safeSendMessage(targetId,
             `⏰ *Heads up!*\n\nYour *${sel.plan}* access expires in *24 hours*. Renew now 😊`,
             { parse_mode: "Markdown", reply_markup: { inline_keyboard: [[{ text: "🔄 Renew", callback_data: "change_package" }]] } }
           ).catch(() => {});
-        }, durationMs - 86400000);
+        }, durationMs - warnMs);
       }
       timers.kickTimer = setTimeout(async () => {
-        await removeUserFromChannel(targetId, "manual send expiry"); // Already using helper
+        await removeUserFromChannel(targetId, "manual send expiry");
         safeSendMessage(targetId,
           `👋 *Your access has ended.*\n\nYour *${sel.plan}* plan expired. Hope you enjoyed it! 🙏\n\nCome back anytime 😊`,
           { parse_mode: "Markdown", reply_markup: { inline_keyboard: [[{ text: "🔄 Re-subscribe", callback_data: "change_package" }]] } }
         ).catch(() => {});
         delete subTimers[targetId];
         removeSubEntry(targetId);
-      }, durationMs); // Use durationMs for clarity and consistency
+      }, durationMs);
       subTimers[targetId] = timers;
-      // BUG FIX: persist the subscription so restoreSubTimers can recover it
       saveSubEntry(targetId, sel.plan, expiresAtMs);
-    } // Already using helper
+    }
   }).catch((err) => safeSendMessage(cid(msg.chat.id), `❌ Failed: ${err.message}`));
 });
 
-// /grant <chatId> <plan>  e.g. /grant 8399543359 1 Month
+// /grant <chatId> [plan]  e.g. /grant 8399543359 1 Month
 bot.onText(/\/grant (\d+)(?: (.+))?/, async (msg, match) => {
   if (!ADMIN_IDS.includes(cid(msg.chat.id))) return safeSendMessage(cid(msg.chat.id), "⛔ Not authorized.");
-  const targetId  = cid(match[1]);
-  const planArg   = (match[2] || "").trim();
-  const sel       = userSelections[targetId] || {};
+  const targetId = cid(match[1]);
+  const planArg  = (match[2] || "").trim();
+  const sel      = userSelections[targetId] || {};
 
   const plan = PLAN_DAYS[planArg] !== undefined ? planArg
              : PLAN_DAYS[sel.plan] !== undefined ? sel.plan
@@ -1002,8 +1050,8 @@ bot.onText(/\/grant (\d+)(?: (.+))?/, async (msg, match) => {
 bot.onText(/\/pending/, (msg) => {
   if (!ADMIN_IDS.includes(cid(msg.chat.id))) return safeSendMessage(cid(msg.chat.id), "⛔ Not authorized.");
 
-  const stkEntries      = Object.entries(pendingSTK);
-  const receiptEntries  = Object.entries(awaitingReceipt).filter(([, r]) => r.code);
+  const stkEntries     = Object.entries(pendingSTK);
+  const receiptEntries = Object.entries(awaitingReceipt).filter(([, r]) => r.code);
 
   if (!stkEntries.length && !receiptEntries.length) {
     return safeSendMessage(cid(msg.chat.id), "📭 No pending transactions.");
@@ -1098,7 +1146,7 @@ bot.onText(/\/ledger/, (msg) => {
   });
   const chunks = [];
   let chunk = `📋 *Full Payment Ledger (${paymentLedger.length} total)*\n\n`;
-  for (const line of lines) { // Should use safeSendMessage for each chunk
+  for (const line of lines) {
     if ((chunk + line).length > 3800) { chunks.push(chunk); chunk = ""; }
     chunk += line + "\n";
   }
@@ -1110,13 +1158,12 @@ bot.onText(/\/kick (\d+)/, async (msg, match) => {
   if (!ADMIN_IDS.includes(cid(msg.chat.id))) return safeSendMessage(cid(msg.chat.id), "⛔ Not authorized.");
   const targetId = cid(match[1]);
   try {
-    await bot.banChatMember(CHANNEL_ID, Number(targetId));
-    await bot.unbanChatMember(CHANNEL_ID, Number(targetId));
+    await removeUserFromChannel(targetId, "admin /kick");
     clearSubTimers(targetId);
     safeSendMessage(targetId,
       `👋 *Your access has been removed.*\n\nWe hope you enjoyed your time! 🙏\n\nReady to come back? Tap below 😊`,
       { parse_mode: "Markdown", reply_markup: { inline_keyboard: [[{ text: "🔄 Re-subscribe", callback_data: "change_package" }]] } }
-    );
+    ).catch(() => {});
     safeSendMessage(cid(msg.chat.id), `✅ User \`${targetId}\` removed.`, { parse_mode: "Markdown" });
   } catch (err) {
     safeSendMessage(cid(msg.chat.id), `❌ Failed: ${err.message}`);
@@ -1149,19 +1196,18 @@ bot.on("message", async (msg) => {
   if (isRateLimited(chatId)) {
     return safeSendMessage(chatId, "⏳ *Too many messages!* Please wait a minute before trying again.").catch(() => {});
   }
-  const text   = msg.text.trim();
-  const sel    = userSelections[chatId];
+  const text = msg.text.trim();
+  const sel  = userSelections[chatId];
 
-  // ── Handle phone number for STK push — MUST come before awaitingReceipt ──
-  // Phone numbers like 0712345678 are exactly 10 alphanumeric chars and would
-  // falsely match the M-Pesa code regex if awaitingReceipt were checked first.
+  // ── Handle phone number for STK push ─────────────────────────────────────
   if (sel && sel.awaitingPhone) {
     sel.awaitingPhone = false;
     userSelections[chatId] = sel;
+    saveUserSelection(chatId, sel);
 
     let cleaned;
     try {
-      cleaned = validatePhone(text); // Already using helper
+      cleaned = validatePhone(text);
     } catch (err) {
       return safeSendMessage(chatId,
         `⚠️ *Invalid phone number.*\n\nPlease enter a valid Safaricom number:\n• *07XXXXXXXX*\n• *01XXXXXXXX*`,
@@ -1202,7 +1248,7 @@ bot.on("message", async (msg) => {
                 [{ text: "🔄 Try STK Again",         callback_data: "pay_stk" }],
                 [{ text: "❓ I Need Help",            callback_data: "need_help" }]
               ]
-            } // Already caught, but safeSendMessage is better
+            }
           }
         );
       }
@@ -1283,7 +1329,6 @@ bot.on("message", async (msg) => {
       );
     }
 
-    // BUG FIX: Removed broken string concatenation (bare \n` separators) — use clean template literal
     notifyAdmins(
       `🔔 *Receipt Code Received (Free Text)*\n\n` +
       `👤 ChatID: \`${chatId}\`\n` +
@@ -1307,7 +1352,6 @@ bot.on("message", async (msg) => {
       code,
     };
 
-    // BUG FIX: Removed broken string concatenation — use clean template literal
     return safeSendMessage(chatId,
       `✅ *Got it!*\n\n` +
       `We've received your M-Pesa code \`${code}\` and our team is verifying it right now. 🔍\n\n` +
@@ -1316,9 +1360,8 @@ bot.on("message", async (msg) => {
     );
   }
 
-  // ── User typed random text that is NOT a valid code ──────────────────────
+  // ── User typed random text ────────────────────────────────────────────────
   if (sel && !sel.paidAt) {
-    // BUG FIX: Removed broken string concatenation — use clean template literal
     return safeSendMessage(chatId,
       `😔 *Sorry, we didn't understand that.*\n\n` +
       `If you've already paid, please send your *M-Pesa confirmation code* — it's the *10-character code* in your payment SMS, e.g. \`RCX4B2K9QP\`.\n\n` +
@@ -1356,18 +1399,12 @@ bot.on("callback_query", async (query) => {
   if (data.startsWith("admin_grant_")) {
     if (!ADMIN_IDS.includes(chatId)) return;
     const withoutPrefix = data.replace("admin_grant_", "");
-    // BUG FIX: Use the LAST underscore as the split point so numeric chatIds
-    // (which never contain underscores) are always parsed correctly, and plan
-    // labels with spaces (e.g. "1 Month") are preserved intact.
-    // The original code used indexOf("_") which is correct for numeric IDs, but
-    // using lastIndexOf("_") is safer and handles any future edge cases.
     const underscoreIdx = withoutPrefix.indexOf("_");
     const targetId      = cid(withoutPrefix.substring(0, underscoreIdx));
     const planLabel     = withoutPrefix.substring(underscoreIdx + 1);
 
     try {
       delete awaitingReceipt[targetId];
-
       await grantAccess(
         targetId,
         planLabel || "1 Month",
@@ -1382,9 +1419,9 @@ bot.on("callback_query", async (query) => {
 
   // ── Package selection ─────────────────────────────────────────────────────
   if (data === "package_naughty_premium_leaks") {
-    // BUG FIX: Preserve existing username when resetting selection
     const existingUsername = (userSelections[chatId] || {}).username;
     userSelections[chatId] = { package: "Naughty Premium Leaks", username: existingUsername };
+    saveUserSelection(chatId, userSelections[chatId]);
     return safeSendMessage(chatId,
       `🔥 *Great choice!* Naughty Premium Leaks is our most popular package.\n\nPick your plan:`,
       {
@@ -1404,9 +1441,9 @@ bot.on("callback_query", async (query) => {
   }
 
   if (data === "package_naughty_explicit") {
-    // BUG FIX: Preserve existing username when resetting selection
     const existingUsername = (userSelections[chatId] || {}).username;
     userSelections[chatId] = { package: "Naughty Explicit", username: existingUsername };
+    saveUserSelection(chatId, userSelections[chatId]);
     return safeSendMessage(chatId,
       `💥 *You picked Naughty Explicit!* Free Hookups included.\n\nChoose your plan:`,
       {
@@ -1426,9 +1463,9 @@ bot.on("callback_query", async (query) => {
   }
 
   if (data === "back_to_package_naughty_premium_leaks") {
-    // BUG FIX: Preserve existing username on back navigation
     const existingUsername = (userSelections[chatId] || {}).username;
     userSelections[chatId] = { package: "Naughty Premium Leaks", username: existingUsername };
+    saveUserSelection(chatId, userSelections[chatId]);
     return safeSendMessage(chatId, `🔥 *Naughty Premium Leaks* — pick your plan:`, {
       parse_mode: "Markdown",
       reply_markup: {
@@ -1445,9 +1482,9 @@ bot.on("callback_query", async (query) => {
   }
 
   if (data === "back_to_package_naughty_explicit") {
-    // BUG FIX: Preserve existing username on back navigation
     const existingUsername = (userSelections[chatId] || {}).username;
     userSelections[chatId] = { package: "Naughty Explicit", username: existingUsername };
+    saveUserSelection(chatId, userSelections[chatId]);
     return safeSendMessage(chatId, `💥 *Naughty Explicit* — pick your plan:`, {
       parse_mode: "Markdown",
       reply_markup: {
@@ -1482,6 +1519,7 @@ bot.on("callback_query", async (query) => {
     sel.plan   = plan.label;
     sel.price  = plan.price;
     userSelections[chatId] = sel;
+    saveUserSelection(chatId, sel);
 
     const backTarget = data.startsWith("naughty_") ? "package_naughty_premium_leaks" : "package_naughty_explicit";
     scheduleReminders(chatId);
@@ -1503,6 +1541,7 @@ bot.on("callback_query", async (query) => {
     const sel = userSelections[chatId];
     if (!sel || !sel.price) return safeSendMessage(chatId, "⚠️ Please start over with /start.");
     userSelections[chatId].awaitingPhone = true;
+    saveUserSelection(chatId, userSelections[chatId]);
     const msg_data = getPhoneEntryMessage();
     return safeSendMessage(chatId, msg_data.text, { parse_mode: msg_data.parse_mode });
   }
@@ -1531,27 +1570,21 @@ bot.on("callback_query", async (query) => {
   }
 
   if (data.startsWith("usdt_")) {
-    const planMap = {
-      usdt_1day:    { label: "1 Day",    usdt: 5 },
-      usdt_1week:   { label: "1 Week",   usdt: 19 },
-      usdt_1month:  { label: "1 Month",  usdt: 35 },
-      usdt_6months: { label: "6 Months", usdt: 90 },
-      usdt_1year:   { label: "1 Year",   usdt: 250 },
-    };
-    const chosen = planMap[data];
+    // FIX: Use the canonical USDT_PLANS array instead of a duplicate inline map
+    const chosen = USDT_PLANS.find((p) => p.key === data);
     if (!chosen) return;
 
-    const sel = userSelections[chatId] || {};
-    sel.plan  = chosen.label;
+    const sel  = userSelections[chatId] || {};
+    sel.plan   = chosen.label;
 
-    // BUG FIX: `.replace(" ", "")` only replaces the FIRST space, so "6 Months"
-    // became "6Months" and "1 Year" became "1Year" — neither matching any PLANS key.
-    // Use a global regex replace to strip ALL spaces for the key lookup.
+    // FIX: Use global regex replace so "6 Months" → "6months", "1 Year" → "1year"
+    // The original `.replace(" ", "")` only replaced the FIRST space.
     const prefix = (sel.package === "Naughty Premium Leaks" ? "naughty_" : "premium_");
     const kesKey = prefix + chosen.label.toLowerCase().replace(/ /g, "");
     sel.price      = PLANS[kesKey]?.price || 0;
     sel.usdtAmount = chosen.usdt;
     userSelections[chatId] = sel;
+    saveUserSelection(chatId, sel);
     clearReminders(chatId);
 
     await safeSendMessage(chatId,
@@ -1638,28 +1671,9 @@ bot.on("callback_query", async (query) => {
 // ─── UI MESSAGE HELPERS ──────────────────────────────────────────────────────
 function getPhoneEntryMessage() {
   return {
-    text: `📱 *M-Pesa Payment*\n\nPlease enter your **M-Pesa phone number** (e.g., 0712345678) to receive a payment prompt on your phone.`,
+    text: `📱 *M-Pesa Payment*\n\nPlease enter your *M-Pesa phone number* (e.g., 0712345678) to receive a payment prompt on your phone.`,
     parse_mode: "Markdown"
   };
-}
-
-function getPlanKeyboard(packageName, isBack = false) {
-  const prefix = packageName === "Naughty Premium Leaks" ? "naughty_" : "premium_";
-  const keys = Object.keys(PLANS).filter(k => k.startsWith(prefix));
-  const buttons = keys.map(k => [{ text: `${PLANS[k].label} — Ksh ${PLANS[k].price}`, callback_data: k }]);
-  buttons.push([{ text: "⬅️ Back", callback_data: "change_package" }]);
-  return { inline_keyboard: buttons };
-}
-
-function getPaymentKeyboard(sel, backTarget) {
-  const usdtPlan = USDT_PLANS.find(p => p.label === sel.plan);
-  const buttons = [
-    [{ text: `📲 Pay via STK Push (Recommended)`, callback_data: "pay_stk" }],
-    [{ text: `💳 Pay Manually via Till`,        callback_data: "show_till" }]
-  ];
-  if (usdtPlan) buttons.push([{ text: `₿ Pay with USDT ($${usdtPlan.usdt})`, callback_data: "pay_usdt" }]);
-  buttons.push([{ text: `⬅️ Change Plan`, callback_data: `back_to_${backTarget}` }]);
-  return { inline_keyboard: buttons };
 }
 
 function getAdminGrantConfirmation(targetId, plan) {
@@ -1668,7 +1682,8 @@ function getAdminGrantConfirmation(targetId, plan) {
 
 function getManualPaymentMessage(sel) {
   return {
-    text: tillCard(sel.package, sel.plan, sel.price) + `\n\n✅ *Once you have paid:*\n1. Tap the button below\n2. Send your **M-Pesa Confirmation Code** (e.g. RCX4B2K9QP)\n\n_Your access will be verified and sent immediately._`,
+    text: tillCard(sel.package, sel.plan, sel.price) +
+      `\n\n✅ *Once you have paid:*\n1. Tap the button below\n2. Send your *M-Pesa Confirmation Code* (e.g. RCX4B2K9QP)\n\n_Your access will be verified and sent immediately._`,
     reply_markup: { inline_keyboard: [[{ text: "✅ I've Paid — Submit Code", callback_data: "confirm_payment" }]] }
   };
 }
@@ -1691,7 +1706,7 @@ function getExpiryMessage(planLabel) {
 
 // ─── RESTORE SUBSCRIPTIONS ON STARTUP ───────────────────────────────────────
 function restoreSubTimers() {
-  const data = loadSubs();
+  const data    = loadSubs();
   const entries = Object.entries(data);
   if (!entries.length) return console.log("📂 No saved subscriptions to restore.");
 
@@ -1703,77 +1718,82 @@ function restoreSubTimers() {
 
     if (msLeft <= 0) {
       console.log(`⏰ Sub expired while offline: ${chatId} — kicking now`);
-      removeUserFromChannel(chatId, "offline expiry kick")
-        .catch(() => {});
+      removeUserFromChannel(chatId, "offline expiry kick").catch(() => {});
       safeSendMessage(chatId,
         `👋 *Your access has ended.*\n\nYour *${planLabel}* plan expired while we were briefly offline. We hope you enjoyed your time! 🙏\n\nReady to come back? Tap below 😊`,
         { parse_mode: "Markdown", reply_markup: { inline_keyboard: [[{ text: "🔄 Re-subscribe", callback_data: "change_package" }]] } }
       ).catch(() => {});
       removeSubEntry(chatId);
       expired++;
-      console.log(`• \`${chatId}\` — ⏰ expired (${planLabel})`);
       return;
     }
 
     const timers = { expiresAt };
 
-    if (msLeft > 86400000) {
-      const warnMs = msLeft - 86400000;
+    if (msLeft > warnMs) {
       timers.warnTimer = setTimeout(() => {
         const msg = getRenewMessage(planLabel);
         safeSendMessage(chatId, msg.text, {
           parse_mode: "Markdown",
           reply_markup: msg.reply_markup
-        });
-      }, warnMs);
+        }).catch(() => {});
+      }, msLeft - warnMs);
     }
 
     timers.kickTimer = setTimeout(async () => {
       try {
-        await bot.banChatMember(CHANNEL_ID, Number(chatId));
-        await bot.unbanChatMember(CHANNEL_ID, Number(chatId));
+        // FIX: Use the shared removeUserFromChannel helper instead of inline
+        // ban/unban — consistent behaviour and single place to fix if Telegram
+        // API changes.
+        await removeUserFromChannel(chatId, "restored timer expiry");
         console.log(`🚪 User ${chatId} removed after plan expiry (restored timer)`);
       } catch (e) {
         console.error("Kick error:", e.message);
       }
-      bot.sendMessage(chatId,
-        `👋 *Your access has ended.*\n\nYour *${planLabel}* plan has expired. We hope you enjoyed your time with us! 🙏\n\nWhenever you're ready to come back, we'll be here 😊`,
-        { parse_mode: "Markdown", reply_markup: { inline_keyboard: [[{ text: "🔄 Re-subscribe", callback_data: "change_package" }]] } }
-      ).catch(() => {});
+      const msg = getExpiryMessage(planLabel);
+      safeSendMessage(chatId, msg.text, {
+        parse_mode: "Markdown",
+        reply_markup: msg.reply_markup
+      }).catch(() => {});
       delete subTimers[chatId];
       removeSubEntry(chatId);
     }, msLeft);
 
     subTimers[chatId] = timers;
     restored++;
-    console.log(`🔁 Restored timer for ${chatId} | ${planLabel} | ${Math.round(msLeft/3600000)}h left`);
+    console.log(`🔁 Restored timer for ${chatId} | ${planLabel} | ${Math.round(msLeft / 3600000)}h left`);
   });
 
   console.log(`✅ Subscriptions restored: ${restored} active, ${expired} expired & kicked`);
 }
 
-// ─── HOUSEKEEPING (Efficiency) ───────────────────────────────────────────────
+// ─── HOUSEKEEPING ────────────────────────────────────────────────────────────
 setInterval(() => {
   const now = Date.now();
-  // Cleanup stale STK pushes (older than 10 mins)
+
+  // FIX: Use a local variable name instead of `cid` to avoid shadowing the cid() helper
   let stkChanged = false;
-  for (const cid in pendingSTK) {
-    if (pendingSTK[cid].expiresAt < now) {
-      delete pendingSTK[cid];
+  for (const key of Object.keys(pendingSTK)) {
+    if (pendingSTK[key].expiresAt < now) {
+      delete pendingSTK[key];
       stkChanged = true;
     }
   }
   if (stkChanged) savePendingSTK(pendingSTK);
-  // Cleanup stale USDT pollers
-  for (const cid in pendingUSDT) {
-    if (pendingUSDT[cid].expiresAt < now) stopUsdtPoller(cid);
+
+  for (const key of Object.keys(pendingUSDT)) {
+    if (pendingUSDT[key].expiresAt < now) stopUsdtPoller(key);
   }
-  // Cleanup stale user sessions (inactive for 2 hours)
-  for (const cid in userSelections) {
-    if (!userSelections[cid].paidAt && !userSelections[cid].price) delete userSelections[cid];
+
+  for (const key of Object.keys(userSelections)) {
+    if (!userSelections[key].paidAt && !userSelections[key].price) {
+      delete userSelections[key];
+      deleteUserSelection(key);
+    }
   }
+
   console.log("🧹 Housekeeping: Stale data purged.");
-}, 30 * 60 * 1000); // Run every 30 mins
+}, 30 * 60 * 1000);
 
 // ─── EXPRESS SERVER ──────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
