@@ -13,6 +13,9 @@ app.use(express.json());
 
 // ─── HEALTH CHECK ────────────────────────────────────────────────────────────
 app.get("/", (req, res) => res.status(200).send("OK"));
+app.get('/ping', (req, res) => {
+  res.send('OK');
+});
 
 // ─── CONFIG ──────────────────────────────────────────────────────────────────
 const TILL_NUMBER     = "4902476";
