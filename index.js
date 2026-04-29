@@ -15,11 +15,16 @@ app.use(express.json());
 app.get("/", (req, res) => res.status(200).send("OK"));
 
 // ─── CONFIG ──────────────────────────────────────────────────────────────────
-const TILL_NUMBER     = process.env.SHORTCODE;       
-3424231
+// IMPORTANT: For Buy Goods (Till), SHORTCODE and TILL_NUMBER must be the SAME value (your till number).
+// If using Paybill, SHORTCODE = paybill number, TILL_NUMBER = account number — but STK push
+// TransactionType must be "CustomerPayBillOnline" for paybill, "CustomerBuyGoodsOnline" for till.
+const TILL_NUMBER     = process.env.TILL_NUMBER || process.env.SHORTCODE;
 const TILL_NAME       = process.env.TILL_NAME || "ALJAKI Enterprise";
 
 const ADMIN_IDS       = ["6954749470", "5355760284"];
+
+// For Buy Goods (Till): SHORTCODE should equal TILL_NUMBER
+// For Paybill: SHORTCODE is the paybill number
 const SHORTCODE       = process.env.SHORTCODE;
 const PASSKEY         = process.env.PASSKEY;
 const CONSUMER_KEY    = process.env.CONSUMER_KEY;
@@ -28,6 +33,10 @@ const CALLBACK_URL    = process.env.CALLBACK_URL || "";
 const BOT_TOKEN       = process.env.BOT_TOKEN;
 const RENDER_URL      = process.env.RENDER_EXTERNAL_URL
   || (CALLBACK_URL ? CALLBACK_URL.replace("/mpesa/callback", "") : null);
+
+// STK Push type: "till" uses CustomerBuyGoodsOnline, "paybill" uses CustomerPayBillOnline
+// Set MPESA_TYPE=paybill in env if you use a paybill number, otherwise defaults to till
+const MPESA_TYPE = (process.env.MPESA_TYPE || "till").toLowerCase();
 
 // ─── PLAN CONFIG ─────────────────────────────────────────────────────────────
 const PLAN_DAYS = {
@@ -123,9 +132,12 @@ pendingSTK = loadPendingSTK();
 // ─── EARLY ENV VALIDATION ────────────────────────────────────────────────────
 (function validateEnv() {
   const required = {
-    BOT_TOKEN, SHORTCODE: process.env.SHORTCODE, PASSKEY: process.env.PASSKEY,
-    CONSUMER_KEY: process.env.CONSUMER_KEY, CONSUMER_SECRET: process.env.CONSUMER_SECRET,
-    CALLBACK_URL: process.env.CALLBACK_URL,
+    BOT_TOKEN,
+    SHORTCODE: process.env.SHORTCODE,
+    PASSKEY:   process.env.PASSKEY,
+    CONSUMER_KEY:    process.env.CONSUMER_KEY,
+    CONSUMER_SECRET: process.env.CONSUMER_SECRET,
+    CALLBACK_URL:    process.env.CALLBACK_URL,
   };
   const missing = Object.entries(required).filter(([, v]) => !v).map(([k]) => k);
   if (missing.length > 0) {
@@ -138,6 +150,7 @@ pendingSTK = loadPendingSTK();
     }, 5000);
   } else {
     console.log("✅ All required environment variables are present.");
+    console.log(`📋 M-Pesa mode: ${MPESA_TYPE.toUpperCase()} | SHORTCODE: ${SHORTCODE} | TILL: ${TILL_NUMBER}`);
   }
 })();
 
@@ -243,10 +256,25 @@ async function safeSendMessage(chatId, text, opts = {}) {
   }
 }
 
+// ─── PHONE VALIDATION ────────────────────────────────────────────────────────
+// Accepts: 07XXXXXXXX, 01XXXXXXXX, 2547XXXXXXXX, 2541XXXXXXXX, +254...
 function validatePhone(phone) {
   let cleaned = phone.replace(/\D/g, "");
-  if (cleaned.startsWith("0")) cleaned = "254" + cleaned.substring(1);
-  if (!/^254[17]\d{8}$/.test(cleaned)) throw new Error("Invalid Safaricom phone number");
+
+  // Handle +254 prefix (already stripped non-digits so just handle leading 254)
+  if (cleaned.startsWith("254")) {
+    // already in international format
+  } else if (cleaned.startsWith("0")) {
+    cleaned = "254" + cleaned.substring(1);
+  } else if (cleaned.length === 9) {
+    // User typed without leading 0 e.g. 712345678
+    cleaned = "254" + cleaned;
+  }
+
+  // Valid Safaricom: 2547XXXXXXXX or 2541XXXXXXXX (12 digits total)
+  if (!/^254[17]\d{8}$/.test(cleaned)) {
+    throw new Error("Invalid Safaricom phone number. Use format 07XXXXXXXX or 01XXXXXXXX");
+  }
   return cleaned;
 }
 
@@ -284,50 +312,220 @@ async function getMpesaToken() {
     );
     return res.data.access_token;
   } catch (err) {
-    notifyAdmins(`🚨 *Daraja Token Error*\n\`${err.response?.data?.errorMessage || err.message}\``);
+    const errMsg = err.response?.data?.errorMessage || err.message;
+    console.error("❌ getMpesaToken error:", errMsg, err.response?.data);
+    notifyAdmins(`🚨 *Daraja Token Error*\n\`${errMsg}\``);
     throw err;
   }
 }
 
-// ─── M-PESA: VERIFY TRANSACTION BY RECEIPT CODE ──────────────────────────────
-// Queries the Daraja Transaction Status API to confirm a receipt code is real
-// and the payment went to our till. Returns the transaction details or null.
-async function verifyMpesaTransaction(receiptCode) {
+// ─── M-PESA: STK PUSH ────────────────────────────────────────────────────────
+// FIX: For Buy Goods (Till):
+//   BusinessShortCode = TILL_NUMBER (your till)
+//   PartyB            = TILL_NUMBER (your till)
+//   TransactionType   = "CustomerBuyGoodsOnline"
+//   Password          = base64(TILL_NUMBER + PASSKEY + timestamp)
+//
+// For Paybill:
+//   BusinessShortCode = SHORTCODE (paybill)
+//   PartyB            = SHORTCODE (paybill)
+//   TransactionType   = "CustomerPayBillOnline"
+//   AccountReference  = your account ref
+//   Password          = base64(SHORTCODE + PASSKEY + timestamp)
+async function stkPush(phone, amount, chatId) {
+  const id = cid(chatId);
   try {
     const token     = await getMpesaToken();
     const timestamp = moment().format("YYYYMMDDHHmmss");
-    const password  = Buffer.from(`${SHORTCODE}${PASSKEY}${timestamp}`).toString("base64");
+
+    // Determine which shortcode to use for password & BusinessShortCode
+    // For till: use TILL_NUMBER. For paybill: use SHORTCODE.
+    const businessShortCode = MPESA_TYPE === "paybill" ? SHORTCODE : TILL_NUMBER;
+    const partyB            = TILL_NUMBER; // always the till/paybill that receives money
+    const transactionType   = MPESA_TYPE === "paybill"
+      ? "CustomerPayBillOnline"
+      : "CustomerBuyGoodsOnline";
+
+    const password = Buffer.from(`${businessShortCode}${PASSKEY}${timestamp}`).toString("base64");
+
+    // Normalize phone
+    let normalized;
+    try {
+      normalized = validatePhone(phone);
+    } catch (validErr) {
+      throw new Error(validErr.message);
+    }
+
+    console.log(`📲 STK Push → phone: ${normalized}, amount: ${Math.ceil(Number(amount))}, businessShortCode: ${businessShortCode}, partyB: ${partyB}, type: ${transactionType}`);
+
+    const payload = {
+      BusinessShortCode: businessShortCode,
+      Password:          password,
+      Timestamp:         timestamp,
+      TransactionType:   transactionType,
+      Amount:            Math.ceil(Number(amount)),
+      PartyA:            normalized,
+      PartyB:            partyB,
+      PhoneNumber:       normalized,
+      CallBackURL:       CALLBACK_URL,
+      AccountReference:  "ALJAKI",
+      TransactionDesc:   "Content Access"
+    };
+
+    console.log("📤 STK payload:", JSON.stringify({ ...payload, Password: "[REDACTED]" }));
 
     const res = await axios.post(
-      "https://api.safaricom.co.ke/mpesa/transactionstatus/v1/query",
+      "https://api.safaricom.co.ke/mpesa/stkpush/v1/processrequest",
+      payload,
       {
-        Initiator:          "apiop", // Your Daraja initiator name from portal
-        SecurityCredential: password,
-        CommandID:          "TransactionStatusQuery",
-        TransactionID:      receiptCode,
-        PartyA:             SHORTCODE,
-        IdentifierType:     "4", // 4 = till number
-        ResultURL:          CALLBACK_URL.replace("/mpesa/callback", "/mpesa/transresult"),
-        QueueTimeOutURL:    CALLBACK_URL.replace("/mpesa/callback", "/mpesa/transresult"),
-        Remarks:            "Verify",
-        Occasion:           ""
-      },
-      { headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" } }
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json"
+        }
+      }
     );
 
-    console.log("🔍 Transaction status query response:", JSON.stringify(res.data));
-    // A ResponseCode of "0" means the query was accepted — result comes via callback
+    console.log("📥 STK response:", JSON.stringify(res.data));
+
+    if (res.data.ResponseCode === "0") {
+      const sel = userSelections[id] || {};
+      console.log(`🔎 stkPush lookup userSelections[${id}]:`, JSON.stringify(sel));
+      const entry = {
+        chatId:    id,
+        plan:      sel.plan    || null,
+        pkg:       sel.package || sel.pkg || null,
+        price:     sel.price   || amount,
+        username:  sel.username || id,
+        expiresAt: Date.now() + (10 * 60 * 1000),
+      };
+      pendingSTK[res.data.CheckoutRequestID] = entry;
+      savePendingSTK(pendingSTK);
+      console.log(`📌 Registered & persisted pending STK: ${res.data.CheckoutRequestID} →`, JSON.stringify(entry));
+    } else {
+      console.warn(`⚠️ STK push non-zero ResponseCode: ${res.data.ResponseCode} — ${res.data.ResponseDescription}`);
+    }
     return res.data;
   } catch (err) {
-    console.error("❌ verifyMpesaTransaction error:", err.response?.data || err.message);
-    return null;
+    // Log the full Daraja error response for debugging
+    const darajaErr = err.response?.data;
+    console.error("❌ stkPush error:", err.message, darajaErr ? JSON.stringify(darajaErr) : "");
+    notifyAdmins(
+      `🚨 *STK Push Failed*\nChat ID: \`${id}\`\n` +
+      `Error: \`${JSON.stringify(darajaErr || err.message)}\``
+    );
+    throw err;
   }
 }
 
-// ─── IN-PROCESS RECEIPT VERIFICATION (C2B query) ────────────────────────────
-// This is a faster, synchronous check using the Daraja Account Balance / C2B
-// confirmation approach. We query the transaction directly and trust the result.
-// Falls back to admin approval if the API call fails.
+// ─── M-PESA CALLBACK ─────────────────────────────────────────────────────────
+app.post("/mpesa/callback", (req, res) => {
+  res.status(200).json({ ResultCode: 0, ResultDesc: "Accepted" });
+  console.log("📩 M-PESA CALLBACK RECEIVED:", JSON.stringify(req.body, null, 2));
+
+  try {
+    const body    = req.body?.Body?.stkCallback;
+    const checkId = body?.CheckoutRequestID;
+    const code    = body?.ResultCode;
+
+    console.log(`🔍 Callback: CheckoutRequestID=${checkId}, ResultCode=${code}`);
+
+    const pending = pendingSTK[checkId];
+
+    if (!pending) {
+      console.warn(`⚠️ Unknown CheckoutRequestID: ${checkId}`);
+      notifyAdmins(
+        `⚠️ *Unknown STK Callback*\n\n` +
+        `CheckoutRequestID: \`${checkId}\`\nResultCode: ${code}\n\n` +
+        `_Server may have restarted after STK push._\n\nIf a user paid:\n\`/grant <chatId>\``
+      );
+      return;
+    }
+
+    delete pendingSTK[checkId];
+    savePendingSTK(pendingSTK);
+    const { chatId, plan, pkg, price, username } = pending;
+    const id = cid(chatId);
+    console.log(`✅ Matched pending STK: chatId=${id}, plan=${plan}, pkg=${pkg}`);
+
+    if (code === 0) {
+      const meta      = body.CallbackMetadata?.Item || [];
+      const get       = (name) => meta.find((i) => i.Name === name)?.Value ?? "—";
+      const amount    = get("Amount");
+      const mpesaCode = get("MpesaReceiptNumber");
+      const phone     = get("PhoneNumber");
+
+      console.log(`💰 Payment confirmed: amount=${amount}, ref=${mpesaCode}, phone=${phone}`);
+
+      const sel  = userSelections[id] || {};
+      sel.paidAt = new Date().toISOString();
+      sel.stkRef = mpesaCode;
+      sel.phone  = phone;
+      if (!sel.plan    && plan) sel.plan    = plan;
+      if (!sel.package && pkg)  sel.package = pkg;
+      userSelections[id] = sel;
+      saveUserSelection(id, sel);
+      clearReminders(id);
+
+      const finalPlan = sel.plan || plan || "1 Month";
+      console.log(`🎯 Final plan for grantAccess: "${finalPlan}"`);
+
+      recordPayment({
+        chatId:   id,
+        username: sel.username || username,
+        pkg:      sel.package  || pkg  || "N/A",
+        plan:     finalPlan,
+        amount,
+        ref:      mpesaCode,
+        phone
+      });
+
+      grantAccess(
+        id,
+        finalPlan,
+        `✅ Ksh *${amount}* received via M-Pesa\n🧾 Ref: \`${mpesaCode}\``
+      );
+
+      notifyAdmins(
+        `💰 *PAYMENT CONFIRMED (STK)*\n\n` +
+        `👤 \`${id}\`\n📦 ${sel.package || pkg || "N/A"} — ${finalPlan}\n` +
+        `💰 Ksh ${amount} | 🧾 \`${mpesaCode}\`\n📱 ${phone}\n\n➡️ Access being sent automatically.`
+      );
+
+    } else {
+      // STK was cancelled/timed out — let user submit receipt manually
+      awaitingReceipt[id] = {
+        plan:  plan || (userSelections[id] || {}).plan || "1 Month",
+        pkg:   pkg  || (userSelections[id] || {}).package || "N/A",
+        price: price || (userSelections[id] || {}).price || 0,
+      };
+
+      safeSendMessage(id,
+        `⚠️ *Payment prompt was not completed.*\n\n` +
+        `This can happen if:\n• The prompt timed out\n• Wrong PIN was entered\n• Network was unstable\n\n` +
+        `📋 *If your M-Pesa was actually deducted*, please type your *M-Pesa confirmation code* from your SMS (e.g. \`RCX4B2K9QP\`) and we'll verify it automatically. 🔍\n\n` +
+        `Otherwise, choose an option below 👇`,
+        {
+          parse_mode: "Markdown",
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: "💳 Pay Manually via Till", callback_data: "show_till" }],
+              [{ text: "🔄 Try STK Push Again",    callback_data: "pay_stk" }],
+              [{ text: "❓ I Need Help",            callback_data: "need_help" }]
+            ]
+          }
+        }
+      ).catch(() => {});
+    }
+  } catch (err) {
+    console.error("STK Callback error:", err.message, err.stack);
+    notifyAdmins(`🚨 *STK Callback crashed*\n\`${err.message}\``);
+  }
+});
+
+// ─── PENDING RECEIPT VERIFICATIONS ───────────────────────────────────────────
+const pendingReceiptVerifications = {};
+
+// ─── M-PESA: VERIFY TRANSACTION BY RECEIPT CODE ──────────────────────────────
 async function autoVerifyReceipt(chatId, receiptCode, receiptInfo) {
   const id = cid(chatId);
 
@@ -345,11 +543,16 @@ async function autoVerifyReceipt(chatId, receiptCode, receiptInfo) {
       { parse_mode: "Markdown" }
     );
 
-    const token = await getMpesaToken();
+    const initiatorName = process.env.MPESA_INITIATOR_NAME;
+    const initiatorPass = process.env.MPESA_INITIATOR_PASS;
 
-    // Use the Daraja Transaction Status API
-    const timestamp = moment().format("YYYYMMDDHHmmss");
-    const password  = Buffer.from(`${SHORTCODE}${PASSKEY}${timestamp}`).toString("base64");
+    if (!initiatorName || !initiatorPass) {
+      console.warn("⚠️ MPESA_INITIATOR_NAME or MPESA_INITIATOR_PASS not set — falling back to admin receipt verification");
+      await fallbackToAdminVerification(id, receiptCode, receiptInfo);
+      return;
+    }
+
+    const token = await getMpesaToken();
 
     // Store pending verification so the result callback can find it
     pendingReceiptVerifications[receiptCode] = {
@@ -359,21 +562,10 @@ async function autoVerifyReceipt(chatId, receiptCode, receiptInfo) {
       price:  receiptInfo.price || 0,
     };
 
-    const initiatorName = process.env.MPESA_INITIATOR_NAME || "apiop";
-    const initiatorPass = process.env.MPESA_INITIATOR_PASS;
-
-    // Build Security Credential — base64 of initiator password encrypted with
-    // Safaricom's public cert. If not configured, fall back to admin flow.
-    if (!initiatorPass) {
-      console.warn("⚠️ MPESA_INITIATOR_PASS not set — falling back to admin receipt verification");
-      delete pendingReceiptVerifications[receiptCode];
-      await fallbackToAdminVerification(id, receiptCode, receiptInfo);
-      return;
-    }
-
-    // For sandbox: password is plain base64. For production: must be RSA-encrypted.
-    // This implementation uses plain base64 (works for sandbox; for prod, encrypt properly).
+    // Security credential: plain base64 for sandbox, RSA-encrypted for production
     const securityCredential = Buffer.from(initiatorPass).toString("base64");
+    const businessShortCode  = MPESA_TYPE === "paybill" ? SHORTCODE : TILL_NUMBER;
+    const identifierType     = MPESA_TYPE === "paybill" ? "4" : "4"; // 4 = Organization till/shortcode
 
     const res = await axios.post(
       "https://api.safaricom.co.ke/mpesa/transactionstatus/v1/query",
@@ -382,8 +574,8 @@ async function autoVerifyReceipt(chatId, receiptCode, receiptInfo) {
         SecurityCredential: securityCredential,
         CommandID:          "TransactionStatusQuery",
         TransactionID:      receiptCode,
-        PartyA:             TILL_NUMBER,
-        IdentifierType:     "4",
+        PartyA:             businessShortCode,
+        IdentifierType:     identifierType,
         ResultURL:          CALLBACK_URL.replace("/mpesa/callback", "/mpesa/transresult"),
         QueueTimeOutURL:    CALLBACK_URL.replace("/mpesa/callback", "/mpesa/transtimeout"),
         Remarks:            "VerifyPayment",
@@ -395,13 +587,11 @@ async function autoVerifyReceipt(chatId, receiptCode, receiptInfo) {
     console.log(`📡 Transaction status query sent for ${receiptCode}:`, JSON.stringify(res.data));
 
     if (res.data.ResponseCode === "0") {
-      // Query accepted — wait for async result via /mpesa/transresult
       await safeSendMessage(id,
         `⏳ *Almost there!*\n\nYour payment code has been sent to M-Pesa for verification.\nYou'll receive your access link automatically once confirmed — usually within 30 seconds. 🔐`,
         { parse_mode: "Markdown" }
       );
     } else {
-      // Query rejected — fall back to admin
       console.warn(`⚠️ Transaction status query rejected: ${res.data.ResponseDescription}`);
       delete pendingReceiptVerifications[receiptCode];
       await fallbackToAdminVerification(id, receiptCode, receiptInfo);
@@ -414,9 +604,6 @@ async function autoVerifyReceipt(chatId, receiptCode, receiptInfo) {
     verifyingCodes.delete(receiptCode);
   }
 }
-
-// Pending receipt verifications waiting for the async Daraja result callback
-const pendingReceiptVerifications = {};
 
 // ─── FALLBACK: SEND TO ADMIN FOR MANUAL APPROVAL ────────────────────────────
 async function fallbackToAdminVerification(chatId, receiptCode, receiptInfo) {
@@ -444,7 +631,6 @@ async function fallbackToAdminVerification(chatId, receiptCode, receiptInfo) {
 }
 
 // ─── DARAJA: TRANSACTION STATUS RESULT CALLBACK ──────────────────────────────
-// Safaricom posts the verification result here asynchronously
 app.post("/mpesa/transresult", async (req, res) => {
   res.status(200).json({ ResultCode: 0, ResultDesc: "Accepted" });
   console.log("📩 TRANSACTION STATUS RESULT:", JSON.stringify(req.body, null, 2));
@@ -467,20 +653,18 @@ app.post("/mpesa/transresult", async (req, res) => {
     const { chatId, plan, pkg, price } = pending;
 
     if (resultCode === 0) {
-      // ── PAYMENT VERIFIED ──────────────────────────────────────────────────
       delete pendingReceiptVerifications[receiptCode];
       delete awaitingReceipt[chatId];
 
-      // Extract transaction details from result parameters
       const params   = result.ResultParameters?.ResultParameter || [];
       const getParam = (name) => params.find((p) => p.Key === name)?.Value ?? "—";
       const amount   = getParam("Amount");
-      const receiver = getParam("DebitPartyName"); // The till that received it
+      const receiver = getParam("DebitPartyName");
       const date     = getParam("TransactionDate");
 
       console.log(`✅ Receipt verified: ${receiptCode} | Amount: ${amount} | Receiver: ${receiver}`);
 
-      // Confirm payment went to our till (extra safety check)
+      // Confirm payment went to our till
       const receiverStr = String(receiver || "");
       if (receiverStr && !receiverStr.includes(TILL_NUMBER) && !receiverStr.toLowerCase().includes("aljaki")) {
         console.warn(`⚠️ Payment went to wrong recipient: ${receiver}`);
@@ -534,18 +718,15 @@ app.post("/mpesa/transresult", async (req, res) => {
       );
 
     } else {
-      // ── VERIFICATION FAILED ───────────────────────────────────────────────
       delete pendingReceiptVerifications[receiptCode];
       const errDesc = result.ResultDesc || "Unknown error";
       console.warn(`❌ Receipt verification failed: ${receiptCode} — ${errDesc}`);
 
-      // Specific failure reasons
-      const isNotFound    = String(errDesc).toLowerCase().includes("not found") ||
-                            String(errDesc).toLowerCase().includes("no records");
-      const isDuplicate   = String(errDesc).toLowerCase().includes("duplicate");
+      const isNotFound  = String(errDesc).toLowerCase().includes("not found") ||
+                          String(errDesc).toLowerCase().includes("no records");
+      const isDuplicate = String(errDesc).toLowerCase().includes("duplicate");
 
       if (isDuplicate) {
-        // Code already used / already paid before — still grant access
         notifyAdmins(
           `⚠️ *Duplicate receipt detected*\n\nCode: \`${receiptCode}\`\nChatID: \`${chatId}\`\n\nPossible replay attack or re-submission. Review manually.`,
           {
@@ -579,7 +760,6 @@ app.post("/mpesa/transresult", async (req, res) => {
           }
         );
       } else {
-        // Generic failure — escalate to admin
         await fallbackToAdminVerification(chatId, receiptCode, { plan, pkg, price });
       }
     }
@@ -701,7 +881,6 @@ async function grantAccess(rawChatId, planLabel, paymentSummary) {
       const timers     = {};
       timers.expiresAt = expiresAtMs;
 
-      // 24-hour warning (only if plan is longer than 1 day)
       if (days > 1) {
         timers.warnTimer = setTimeout(() => {
           safeSendMessage(chatId,
@@ -714,7 +893,6 @@ async function grantAccess(rawChatId, planLabel, paymentSummary) {
         }, durationMs - warnMs);
       }
 
-      // Kick timer — fires exactly when the plan expires
       console.log(`⏰ Kick timer set: ${Math.round(durationMs / 3600000)}h from now (${durationMs}ms)`);
       timers.kickTimer = setTimeout(async () => {
         try {
@@ -724,7 +902,6 @@ async function grantAccess(rawChatId, planLabel, paymentSummary) {
           console.error("Kick error:", e.message);
         }
 
-        // Notify user their subscription has ended
         await safeSendMessage(chatId,
           `👋 *Your subscription has ended.*\n\n` +
           `Your *${resolvedLabel}* plan has expired.\n\n` +
@@ -785,9 +962,9 @@ function clearSubTimers(chatId) {
 }
 
 // ─── USDT CONFIG ─────────────────────────────────────────────────────────────
-const USDT_WALLET    = process.env.USDT_WALLET || "TU...your_wallet_address";
-const TRONGRID_KEY   = process.env.TRONGRID_KEY || "";
-const pendingUSDT    = {};
+const USDT_WALLET  = process.env.USDT_WALLET || "TU...your_wallet_address";
+const TRONGRID_KEY = process.env.TRONGRID_KEY || "";
+const pendingUSDT  = {};
 
 // ─── RATE LIMITING ──────────────────────────────────────────────────────────
 const messageCounts     = {};
@@ -926,171 +1103,6 @@ function scheduleReminders(chatId) {
   );
   reminderTimers[id] = { timers };
 }
-
-// ─── M-PESA: STK PUSH ────────────────────────────────────────────────────────
-async function stkPush(phone, amount, chatId) {
-  const id = cid(chatId);
-  try {
-    const token     = await getMpesaToken();
-    const timestamp = moment().format("YYYYMMDDHHmmss");
-    const password  = Buffer.from(`${SHORTCODE}${PASSKEY}${timestamp}`).toString("base64");
-
-    let normalized = phone.trim().replace(/^\+/, "").replace(/^0/, "254");
-
-    if (!/^2547\d{8}$|^2541\d{8}$/.test(normalized)) {
-      throw new Error(`Invalid phone format: ${normalized}`);
-    }
-
-    const payload = {
-      BusinessShortCode: SHORTCODE,
-      Password:          password,
-      Timestamp:         timestamp,
-      TransactionType:   "CustomerBuyGoodsOnline",
-      Amount:            Math.ceil(Number(amount)),
-      PartyA:            normalized,
-      PartyB:            TILL_NUMBER,
-      PhoneNumber:       normalized,
-      CallBackURL:       CALLBACK_URL,
-      AccountReference:  "ALJAKI",
-      TransactionDesc:   "Content Access"
-    };
-
-    const res = await axios.post(
-      "https://api.safaricom.co.ke/mpesa/stkpush/v1/processrequest",
-      payload,
-      { headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" } }
-    );
-
-    if (res.data.ResponseCode === "0") {
-      const sel = userSelections[id] || {};
-      console.log(`🔎 stkPush lookup userSelections[${id}]:`, JSON.stringify(sel));
-      const entry = {
-        chatId:   id,
-        plan:     sel.plan    || null,
-        pkg:      sel.package || sel.pkg || null,
-        price:    sel.price   || amount,
-        username: sel.username || id,
-        expiresAt: Date.now() + (10 * 60 * 1000),
-      };
-      pendingSTK[res.data.CheckoutRequestID] = entry;
-      savePendingSTK(pendingSTK);
-      console.log(`📌 Registered & persisted pending STK: ${res.data.CheckoutRequestID} →`, JSON.stringify(entry));
-    } else {
-      console.warn(`⚠️ STK push non-zero ResponseCode: ${res.data.ResponseCode} — ${res.data.ResponseDescription}`);
-    }
-    return res.data;
-  } catch (err) {
-    notifyAdmins(
-      `🚨 *STK Push Failed*\nChat ID: \`${id}\`\n` +
-      `Error: \`${JSON.stringify(err.response?.data || err.message)}\``
-    );
-    throw err;
-  }
-}
-
-// ─── M-PESA CALLBACK ─────────────────────────────────────────────────────────
-app.post("/mpesa/callback", (req, res) => {
-  res.status(200).json({ ResultCode: 0, ResultDesc: "Accepted" });
-  console.log("📩 M-PESA CALLBACK RECEIVED:", JSON.stringify(req.body, null, 2));
-
-  try {
-    const body    = req.body?.Body?.stkCallback;
-    const checkId = body?.CheckoutRequestID;
-    const code    = body?.ResultCode;
-
-    console.log(`🔍 Callback: CheckoutRequestID=${checkId}, ResultCode=${code}`);
-
-    const pending = pendingSTK[checkId];
-
-    if (!pending) {
-      console.warn(`⚠️ Unknown CheckoutRequestID: ${checkId}`);
-      notifyAdmins(
-        `⚠️ *Unknown STK Callback*\n\n` +
-        `CheckoutRequestID: \`${checkId}\`\nResultCode: ${code}\n\n` +
-        `_Server may have restarted after STK push._\n\nIf a user paid:\n\`/grant <chatId>\``
-      );
-      return;
-    }
-
-    delete pendingSTK[checkId];
-    savePendingSTK(pendingSTK);
-    const { chatId, plan, pkg, price, username } = pending;
-    const id = cid(chatId);
-    console.log(`✅ Matched pending STK: chatId=${id}, plan=${plan}, pkg=${pkg}`);
-
-    if (code === 0) {
-      const meta      = body.CallbackMetadata?.Item || [];
-      const get       = (name) => meta.find((i) => i.Name === name)?.Value ?? "—";
-      const amount    = get("Amount");
-      const mpesaCode = get("MpesaReceiptNumber");
-      const phone     = get("PhoneNumber");
-
-      console.log(`💰 Payment confirmed: amount=${amount}, ref=${mpesaCode}, phone=${phone}`);
-
-      const sel  = userSelections[id] || {};
-      sel.paidAt = new Date().toISOString();
-      sel.stkRef = mpesaCode;
-      sel.phone  = phone;
-      if (!sel.plan    && plan) sel.plan    = plan;
-      if (!sel.package && pkg)  sel.package = pkg;
-      userSelections[id] = sel;
-      saveUserSelection(id, sel);
-      clearReminders(id);
-
-      const finalPlan = sel.plan || plan || "1 Month";
-      console.log(`🎯 Final plan for grantAccess: "${finalPlan}"`);
-
-      recordPayment({
-        chatId:   id,
-        username: sel.username || username,
-        pkg:      sel.package  || pkg  || "N/A",
-        plan:     finalPlan,
-        amount,
-        ref:      mpesaCode,
-        phone
-      });
-
-      grantAccess(
-        id,
-        finalPlan,
-        `✅ Ksh *${amount}* received via M-Pesa\n🧾 Ref: \`${mpesaCode}\``
-      );
-
-      notifyAdmins(
-        `💰 *PAYMENT CONFIRMED (STK)*\n\n` +
-        `👤 \`${id}\`\n📦 ${sel.package || pkg || "N/A"} — ${finalPlan}\n` +
-        `💰 Ksh ${amount} | 🧾 \`${mpesaCode}\`\n📱 ${phone}\n\n➡️ Access being sent automatically.`
-      );
-
-    } else {
-      awaitingReceipt[id] = {
-        plan:  plan || (userSelections[id] || {}).plan || "1 Month",
-        pkg:   pkg  || (userSelections[id] || {}).package || "N/A",
-        price: price || (userSelections[id] || {}).price || 0,
-      };
-
-      safeSendMessage(id,
-        `⚠️ *Payment prompt was not completed.*\n\n` +
-        `This can happen if:\n• The prompt timed out\n• Wrong PIN was entered\n• Network was unstable\n\n` +
-        `📋 *If your M-Pesa was actually deducted*, please type your *M-Pesa confirmation code* from your SMS (e.g. \`RCX4B2K9QP\`) and we'll verify it automatically. 🔍\n\n` +
-        `Otherwise, choose an option below 👇`,
-        {
-          parse_mode: "Markdown",
-          reply_markup: {
-            inline_keyboard: [
-              [{ text: "💳 Pay Manually via Till", callback_data: "show_till" }],
-              [{ text: "🔄 Try STK Push Again",    callback_data: "pay_stk" }],
-              [{ text: "❓ I Need Help",            callback_data: "need_help" }]
-            ]
-          }
-        }
-      ).catch(() => {});
-    }
-  } catch (err) {
-    console.error("STK Callback error:", err.message, err.stack);
-    notifyAdmins(`🚨 *STK Callback crashed*\n\`${err.message}\``);
-  }
-});
 
 // ─── USDT: POLL TRONGRID ─────────────────────────────────────────────────────
 async function startUsdtPoller(chatId, expectedUsdt) {
@@ -1238,6 +1250,38 @@ bot.onText(/\/testlink/, async (msg) => {
   }
 });
 
+// ─── /testmpesa — admin command to diagnose STK push config ──────────────────
+bot.onText(/\/testmpesa/, async (msg) => {
+  if (!ADMIN_IDS.includes(cid(msg.chat.id))) return safeSendMessage(cid(msg.chat.id), "⛔ Not authorized.");
+  const chatId = cid(msg.chat.id);
+  await safeSendMessage(chatId,
+    `🔧 *M-Pesa Config Diagnostics*\n\n` +
+    `• SHORTCODE: \`${SHORTCODE || "NOT SET"}\`\n` +
+    `• TILL_NUMBER: \`${TILL_NUMBER || "NOT SET"}\`\n` +
+    `• MPESA_TYPE: \`${MPESA_TYPE}\`\n` +
+    `• PASSKEY: \`${PASSKEY ? "✅ set (" + PASSKEY.length + " chars)" : "❌ NOT SET"}\`\n` +
+    `• CONSUMER_KEY: \`${CONSUMER_KEY ? "✅ set" : "❌ NOT SET"}\`\n` +
+    `• CONSUMER_SECRET: \`${CONSUMER_SECRET ? "✅ set" : "❌ NOT SET"}\`\n` +
+    `• CALLBACK_URL: \`${CALLBACK_URL || "NOT SET"}\`\n` +
+    `• MPESA_INITIATOR_NAME: \`${process.env.MPESA_INITIATOR_NAME || "NOT SET"}\`\n` +
+    `• MPESA_INITIATOR_PASS: \`${process.env.MPESA_INITIATOR_PASS ? "✅ set" : "NOT SET (receipt verify fallback to admin)"}\`\n\n` +
+    `_Testing token fetch..._`,
+    { parse_mode: "Markdown" }
+  );
+  try {
+    const token = await getMpesaToken();
+    await safeSendMessage(chatId,
+      `✅ *Daraja token OK!*\n\nToken starts with: \`${token.substring(0, 10)}...\`\n\n_Your API credentials are working correctly._`,
+      { parse_mode: "Markdown" }
+    );
+  } catch (err) {
+    await safeSendMessage(chatId,
+      `❌ *Token fetch failed*\n\nError: \`${err.response?.data?.errorMessage || err.message}\`\n\nCheck CONSUMER_KEY and CONSUMER_SECRET.`,
+      { parse_mode: "Markdown" }
+    );
+  }
+});
+
 bot.onText(/\/config$/, (msg) => {
   const chatId = cid(msg.chat.id);
   if (!ADMIN_IDS.includes(chatId)) return safeSendMessage(chatId, "⛔ Not authorized.");
@@ -1247,7 +1291,8 @@ bot.onText(/\/config$/, (msg) => {
     `• Auto-send invite links: *${autoSendInvite ? "ON" : "OFF"}*\n\n` +
     `Change with:\n` +
     `/autoexpire on|off\n` +
-    `/autoinvite on|off`,
+    `/autoinvite on|off\n\n` +
+    `Run /testmpesa to diagnose M-Pesa config.`,
     { parse_mode: "Markdown" }
   );
 });
@@ -1531,14 +1576,14 @@ bot.on("message", async (msg) => {
       cleaned = validatePhone(text);
     } catch (err) {
       return safeSendMessage(chatId,
-        `⚠️ *Invalid phone number.*\n\nPlease enter a valid Safaricom number:\n• *07XXXXXXXX*\n• *01XXXXXXXX*`,
+        `⚠️ *Invalid phone number.*\n\nPlease enter a valid Safaricom number:\n• *07XXXXXXXX*\n• *01XXXXXXXX*\n\nExample: 0712345678`,
         { parse_mode: "Markdown" }
       );
     }
 
     await sendTyping(chatId, 1000);
     await safeSendMessage(chatId,
-      `⏳ *Sending STK push to ${text}...*\n\nCheck your phone and enter your M-Pesa PIN. 📲`,
+      `⏳ *Sending payment prompt to ${text}...*\n\nCheck your phone and enter your M-Pesa PIN when the prompt appears. 📲`,
       { parse_mode: "Markdown" }
     );
 
@@ -1546,7 +1591,7 @@ bot.on("message", async (msg) => {
       const result = await stkPush(text, sel.price, chatId);
       if (result.ResponseCode === "0") {
         await safeSendMessage(chatId,
-          `✅ *Payment prompt sent!*\n\nEnter your M-Pesa PIN to complete. Access will be sent automatically once confirmed. 🔐\n\n` +
+          `✅ *Payment prompt sent!*\n\nEnter your M-Pesa PIN to complete the payment. Access will be sent to you automatically once confirmed. 🔐\n\n` +
           `_If you've already paid but don't receive access within 2 minutes, tap the button below._`,
           {
             parse_mode: "Markdown",
@@ -1560,7 +1605,7 @@ bot.on("message", async (msg) => {
         );
       } else {
         await safeSendMessage(chatId,
-          `⚠️ *Could not send payment prompt.*\n\nReason: _${result.ResponseDescription || "Unknown error"}_\n\nPay manually via M-Pesa till instead 👇`,
+          `⚠️ *Could not send payment prompt.*\n\nReason: _${result.ResponseDescription || "Unknown error"}_\n\nYou can still pay manually via M-Pesa till 👇`,
           {
             parse_mode: "Markdown",
             reply_markup: {
@@ -1574,13 +1619,16 @@ bot.on("message", async (msg) => {
         );
       }
     } catch (err) {
+      const errDetail = err.response?.data?.errorMessage || err.response?.data?.RequestID || err.message;
+      console.error("STK push catch:", errDetail, err.response?.data);
       await safeSendMessage(chatId,
-        `❌ *Payment request failed.*\n\n_${err.response?.data?.errorMessage || err.message}_\n\nYou can still pay manually 👇`,
+        `❌ *Payment request failed.*\n\n_${errDetail}_\n\nYou can still pay manually via M-Pesa till 👇`,
         {
           parse_mode: "Markdown",
           reply_markup: {
             inline_keyboard: [
               [{ text: "💳 Pay Manually via Till", callback_data: "show_till" }],
+              [{ text: "🔄 Try STK Again",         callback_data: "pay_stk" }],
               [{ text: "❓ I Need Help",            callback_data: "need_help" }]
             ]
           }
@@ -1610,16 +1658,12 @@ bot.on("message", async (msg) => {
       );
     }
 
-    // Update awaitingReceipt with the code so /pending shows it
     awaitingReceipt[chatId] = { ...receiptInfo, code };
-
-    // ── AUTO-VERIFY via Daraja Transaction Status API ─────────────────────
-    // This replaces the old "notify admin and wait" flow with automatic verification.
     await autoVerifyReceipt(chatId, code, receiptInfo);
     return;
   }
 
-  // ── User typed something freely — try to detect an M-Pesa code ────────────
+  // ── User typed something that looks like an M-Pesa code ───────────────────
   const looksLikeCode = /^[A-Z0-9]{10}$/.test(text.toUpperCase());
 
   if (looksLikeCode) {
@@ -1633,7 +1677,6 @@ bot.on("message", async (msg) => {
       );
     }
 
-    // Set up awaitingReceipt from current session data so auto-verify has full context
     const receiptInfo = {
       plan:  sel2.plan    || "1 Month",
       pkg:   sel2.package || "N/A",
@@ -1641,8 +1684,6 @@ bot.on("message", async (msg) => {
       code,
     };
     awaitingReceipt[chatId] = receiptInfo;
-
-    // ── AUTO-VERIFY this free-text receipt too ────────────────────────────
     await autoVerifyReceipt(chatId, code, receiptInfo);
     return;
   }
@@ -1657,9 +1698,9 @@ bot.on("message", async (msg) => {
         parse_mode: "Markdown",
         reply_markup: {
           inline_keyboard: [
-            [{ text: "📲 Pay via STK Push",    callback_data: "pay_stk" }],
-            [{ text: "💳 Pay Manually via Till", callback_data: "show_till" }],
-            [{ text: "❓ I Need Help",           callback_data: "need_help" }]
+            [{ text: "📲 Pay via STK Push",      callback_data: "pay_stk" }],
+            [{ text: "💳 Pay Manually via Till",  callback_data: "show_till" }],
+            [{ text: "❓ I Need Help",            callback_data: "need_help" }]
           ]
         }
       }
@@ -1682,7 +1723,6 @@ bot.on("callback_query", async (query) => {
   bot.answerCallbackQuery(query.id).catch(() => {});
   await sendTyping(chatId, 600);
 
-  // ── No-op (used by admin reject button) ──────────────────────────────────
   if (data === "noop") return;
 
   // ── Admin one-tap grant ───────────────────────────────────────────────────
@@ -1695,9 +1735,11 @@ bot.on("callback_query", async (query) => {
 
     try {
       delete awaitingReceipt[targetId];
-      delete pendingReceiptVerifications[
-        Object.keys(pendingReceiptVerifications).find(k => pendingReceiptVerifications[k].chatId === targetId)
-      ];
+      const pendingKey = Object.keys(pendingReceiptVerifications).find(
+        k => pendingReceiptVerifications[k].chatId === targetId
+      );
+      if (pendingKey) delete pendingReceiptVerifications[pendingKey];
+
       await grantAccess(
         targetId,
         planLabel || "1 Month",
@@ -1821,6 +1863,7 @@ bot.on("callback_query", async (query) => {
     const keyboard = [
       [{ text: `📲 Pay via STK Push (Recommended)`, callback_data: "pay_stk" }],
       ...(usdtPlan ? [[{ text: `₿ Pay with Crypto  ($${usdtPlan.usdt} USDT)`, callback_data: "pay_usdt" }]] : []),
+      [{ text: `💳 Pay Manually via Till`, callback_data: "show_till" }],
       [{ text: `⬅️ Change Plan`, callback_data: `back_to_${backTarget}` }]
     ];
 
@@ -1960,7 +2003,7 @@ bot.on("callback_query", async (query) => {
 // ─── UI MESSAGE HELPERS ──────────────────────────────────────────────────────
 function getPhoneEntryMessage() {
   return {
-    text: `📱 *M-Pesa Payment*\n\nPlease enter your *M-Pesa phone number* (e.g., 0712345678) to receive a payment prompt on your phone.`,
+    text: `📱 *M-Pesa STK Push Payment*\n\nPlease enter your *M-Pesa phone number* to receive a payment prompt directly on your phone.\n\nFormat: *07XXXXXXXX* or *01XXXXXXXX*\n\nExample: \`0712345678\``,
     parse_mode: "Markdown"
   };
 }
@@ -2071,11 +2114,6 @@ setInterval(() => {
     if (pendingUSDT[key].expiresAt < now) stopUsdtPoller(key);
   }
 
-  // Clean up stale receipt verifications older than 10 minutes
-  for (const code of Object.keys(pendingReceiptVerifications)) {
-    // No built-in expiry on these — just log them so admins can see via /pending
-  }
-
   for (const key of Object.keys(userSelections)) {
     if (!userSelections[key].paidAt && !userSelections[key].price) {
       delete userSelections[key];
@@ -2093,6 +2131,7 @@ app.listen(PORT, () => {
   console.log(`📡 M-Pesa callback URL: ${CALLBACK_URL || "⚠️ NOT SET"}`);
   console.log(`📡 Transaction result URL: ${CALLBACK_URL ? CALLBACK_URL.replace("/mpesa/callback", "/mpesa/transresult") : "⚠️ NOT SET"}`);
   console.log(`📺 Channel ID: ${CHANNEL_ID}`);
+  console.log(`💳 M-Pesa type: ${MPESA_TYPE.toUpperCase()} | ShortCode: ${SHORTCODE} | Till: ${TILL_NUMBER}`);
 
   setTimeout(restoreSubTimers, 3000);
 
