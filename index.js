@@ -101,30 +101,64 @@ const SUBS_FILE         = path.join(__dirname, "subscriptions.json");
 const PENDING_STK_FILE  = path.join(__dirname, "pending_stk.json");
 const USER_SEL_FILE     = path.join(__dirname, "user_selections.json");
 
-// ─── BOT: LONG POLLING (with webhook cleanup) ────────────────────────────────
+// ─── BOT: LONG POLLING (with webhook cleanup + 409 backoff) ──────────────────
 const bot = new TelegramBot(BOT_TOKEN, { polling: false });
 
-(async () => {
+let pollingActive = false;
+
+async function startPollingWithRetry(attempt = 1) {
   try {
+    // Delete any webhook first (clears previous sessions)
     await bot.deleteWebHook({ drop_pending_updates: true });
-    console.log("✅ Webhook deleted (any old webhook is now cleared).");
+    console.log("✅ Webhook deleted.");
   } catch (err) {
-    console.warn("⚠️  Could not delete webhook (may not have existed):", err.message);
+    console.warn("⚠️  Could not delete webhook:", err.message);
   }
 
-  await new Promise((r) => setTimeout(r, 1500));
+  // Wait longer on retries to let Telegram release the previous connection
+  const delay = Math.min(attempt * 3000, 15000);
+  console.log(`⏳ Waiting ${delay / 1000}s before starting polling (attempt ${attempt})...`);
+  await new Promise((r) => setTimeout(r, delay));
 
-  bot.startPolling({ interval: 1000, params: { timeout: 10 } });
-  console.log("✅ Bot started in long-polling mode.");
-})();
+  try {
+    await bot.startPolling({ interval: 1000, params: { timeout: 30 } });
+    pollingActive = true;
+    console.log("✅ Bot started in long-polling mode.");
+  } catch (err) {
+    console.error("❌ Failed to start polling:", err.message);
+  }
+}
 
-bot.on("polling_error", (err) => {
+startPollingWithRetry();
+
+bot.on("polling_error", async (err) => {
   if (err.code === "ETELEGRAM" && err.message.includes("409")) {
-    console.warn("⚠️  Polling 409 — waiting for Telegram to settle...");
+    if (pollingActive) {
+      console.warn("⚠️  Polling 409 conflict — stopping and retrying in 10s...");
+      pollingActive = false;
+      try { await bot.stopPolling(); } catch (_) {}
+      setTimeout(() => startPollingWithRetry(2), 10000);
+    }
   } else {
     console.error("❌ Polling error:", err.message);
   }
 });
+
+// ─── GRACEFUL SHUTDOWN ────────────────────────────────────────────────────────
+async function shutdown(signal) {
+  console.log(`\n🛑 ${signal} received — shutting down gracefully...`);
+  pollingActive = false;
+  try {
+    await bot.stopPolling();
+    console.log("✅ Bot polling stopped.");
+  } catch (err) {
+    console.warn("⚠️  Error stopping polling:", err.message);
+  }
+  process.exit(0);
+}
+
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT",  () => shutdown("SIGINT"));
 
 // ─── LOAD PERSISTED DATA ────────────────────────────────────────────────────
 pendingSTK = loadPendingSTK();
