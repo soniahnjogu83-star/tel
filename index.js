@@ -45,7 +45,7 @@ const PLANS = {
   naughty_1month:  { label: "1 Month",  price: 450 },
   naughty_6months: { label: "6 Months", price: 2500 },
   naughty_1year:   { label: "1 Year",   price: 6200 },
-  naughty_test:    { label: "20 Min Test", price: 1 }, // 1 KSH for testing
+  naughty_test:    { label: "20 Min Test", price: 1 },
   premium_1day:    { label: "1 Day",    price: 50 },
   premium_1week:   { label: "1 Week",   price: 220 },
   premium_2weeks:  { label: "2 Weeks",  price: 400 },
@@ -96,13 +96,13 @@ const bot = new TelegramBot(BOT_TOKEN, { polling: false });
   console.log("✅ Bot started in long-polling mode.");
 })();
 
-//bot.on("polling_error", (err) => {
-  //if (err.code === "ETELEGRAM" && err.message.includes("409")) {
-   // console.warn("⚠️  Polling 409 — waiting for Telegram to settle...");
-  //} else {
-    //console.error("❌ Polling error:", err.message);
- // }
-//});
+bot.on("polling_error", (err) => {
+  if (err.code === "ETELEGRAM" && err.message.includes("409")) {
+    console.warn("⚠️  Polling 409 — waiting for Telegram to settle...");
+  } else {
+    console.error("❌ Polling error:", err.message);
+  }
+});
 
 // ─── LOAD PERSISTED DATA ────────────────────────────────────────────────────
 function loadPendingSTK() {
@@ -184,9 +184,9 @@ function saveSubs(data) {
 pendingSTK = loadPendingSTK();
 Object.assign(userSelections, loadUserSelections());
 
-function saveSubEntry(chatId, planLabel, expiresAt) {
+function saveSubEntry(chatId, planLabel, expiresAt, username) {
   const data = loadSubs();
-  data[cid(chatId)] = { planLabel, expiresAt };
+  data[cid(chatId)] = { planLabel, expiresAt, username };
   saveSubs(data);
 }
 
@@ -260,6 +260,9 @@ async function grantAccess(rawChatId, planLabel, paymentSummary) {
     delete accessAttempts[chatId];
     return;
   }
+
+  // Get username for storage
+  const username = userSelections[chatId]?.username || `User ${chatId}`;
 
   try {
     // Verify bot has channel permissions first
@@ -344,13 +347,12 @@ async function grantAccess(rawChatId, planLabel, paymentSummary) {
           await removeUserFromChannel(chatId, "plan expiry");
           console.log(`🚪 User ${chatId} removed after ${resolvedLabel} plan expiry`);
           
+          // Send personalized expiry message with user's name
           await safeSendMessage(chatId,
-            `👋 *Your access has ended.*\n\n` +
-            `Your *${resolvedLabel}* plan has expired. We hope you enjoyed your time with us! 🙏\n\n` +
-            `Whenever you're ready to come back, tap the button below 😊`,
+            `Dear *${username}*, your sweet subscription moment is over. Looks like your sweet moment just timed out ⏳\n\nTap below to resubscribe and see the new uploads 👇`,
             {
               parse_mode: "Markdown",
-              reply_markup: { inline_keyboard: [[{ text: "🔄 Re-subscribe", callback_data: "change_package" }]] }
+              reply_markup: { inline_keyboard: [[{ text: "🔄 Resubscribe Now", callback_data: "change_package" }]] }
             }
           );
         } catch (e) {
@@ -365,7 +367,7 @@ async function grantAccess(rawChatId, planLabel, paymentSummary) {
       if (resolvedLabel !== "20 Min Test" && days > 1 && durationMs > warnMs) {
         warnTimer = setTimeout(() => {
           safeSendMessage(chatId,
-            `⏰ *Heads up!*\n\nYour *${resolvedLabel}* access expires in *24 hours*.\n\nRenew now to stay connected 😊`,
+            `⏰ *Heads up, ${username}!*\n\nYour *${resolvedLabel}* access expires in *24 hours*.\n\nRenew now to stay connected 😊`,
             {
               parse_mode: "Markdown",
               reply_markup: { inline_keyboard: [[{ text: "🔄 Renew My Access", callback_data: "change_package" }]] }
@@ -375,7 +377,7 @@ async function grantAccess(rawChatId, planLabel, paymentSummary) {
       }
       
       subTimers[chatId] = { expiresAt: expiresAtMs, kickTimer, warnTimer };
-      saveSubEntry(chatId, resolvedLabel, expiresAtMs);
+      saveSubEntry(chatId, resolvedLabel, expiresAtMs, username);
     }
 
     console.log(`✅ Access fully set up for ${chatId} | ${resolvedLabel}`);
@@ -425,6 +427,62 @@ function notifyAdmins(message, opts = {}) {
     safeSendMessage(id, message, { parse_mode: "Markdown", ...opts })
       .catch((err) => console.error(`❌ Admin notify failed [${id}]: ${err.message}`));
   });
+}
+
+// ─── RESTORE ACTIVE SUBSCRIPTIONS ON STARTUP ─────────────────────────────────
+async function restoreActiveSubscriptions() {
+  const subs = loadSubs();
+  const now = Date.now();
+  
+  for (const [chatId, sub] of Object.entries(subs)) {
+    if (sub.expiresAt > now) {
+      const remainingMs = sub.expiresAt - now;
+      const resolvedLabel = sub.planLabel;
+      const username = sub.username || `User ${chatId}`;
+      
+      console.log(`🔄 Restoring subscription for ${chatId} (${resolvedLabel}), ${remainingMs}ms remaining`);
+      
+      const kickTimer = setTimeout(async () => {
+        try {
+          await removeUserFromChannel(chatId, "plan expiry (restored)");
+          await safeSendMessage(chatId,
+            `Dear *${username}*, your sweet subscription moment is over. Looks like your sweet moment just timed out ⏳\n\nTap below to resubscribe and see the new uploads 👇`,
+            {
+              parse_mode: "Markdown",
+              reply_markup: { inline_keyboard: [[{ text: "🔄 Resubscribe Now", callback_data: "change_package" }]] }
+            }
+          );
+        } catch (e) {
+          console.error("Restored kick error:", e.message);
+        }
+        delete subTimers[chatId];
+        removeSubEntry(chatId);
+      }, remainingMs);
+      
+      // Set up warning timer if needed
+      let warnTimer = null;
+      const days = PLAN_DAYS[resolvedLabel];
+      const durationMs = (resolvedLabel === "20 Min Test") ? 20 * 60 * 1000 : days * 24 * 60 * 60 * 1000;
+      if (resolvedLabel !== "20 Min Test" && days > 1 && remainingMs > warnMs) {
+        warnTimer = setTimeout(() => {
+          safeSendMessage(chatId,
+            `⏰ *Heads up, ${username}!*\n\nYour *${resolvedLabel}* access expires in *24 hours*.\n\nRenew now to stay connected 😊`,
+            {
+              parse_mode: "Markdown",
+              reply_markup: { inline_keyboard: [[{ text: "🔄 Renew My Access", callback_data: "change_package" }]] }
+            }
+          ).catch(() => {});
+        }, remainingMs - warnMs);
+      }
+      
+      subTimers[chatId] = { expiresAt: sub.expiresAt, kickTimer, warnTimer };
+    } else {
+      // Subscription already expired, remove the user
+      console.log(`🗑️ Removing expired subscription for ${chatId}`);
+      removeSubEntry(chatId);
+      await removeUserFromChannel(chatId, "expired on startup");
+    }
+  }
 }
 
 // ─── M-PESA: GET ACCESS TOKEN ─────────────────────────────────────────────────
@@ -541,17 +599,21 @@ app.post("/mpesa/callback", (req, res) => {
   }
 });
 
-// ─── /start ──────────────────────────────────────────────────────────────────
+// ─── /start (FIXED - Completely resets user state) ──────────────────────────────
 bot.onText(/\/start/, async (msg) => {
   const chatId = cid(msg.chat.id);
   const username = msg.from.username ? `@${msg.from.username}` : msg.from.first_name;
   
-  if (!userSelections[chatId]) userSelections[chatId] = {};
-  userSelections[chatId].username = username;
+  // Reset user selection completely when /start is used
+  userSelections[chatId] = {
+    username: username,
+    freshStart: true
+  };
   saveUserSelection(chatId, userSelections[chatId]);
 
   await safeSendMessage(chatId,
-    `Welcome ${username} 🚀\n\nSelect your package below:`,
+    `🎉 *Welcome back, ${username}!* 🎉\n\n` +
+    `Ready for some sweet content? Select your package below 👇`,
     {
       reply_markup: {
         inline_keyboard: [
@@ -589,7 +651,12 @@ bot.on("callback_query", async (query) => {
   bot.answerCallbackQuery(query.id).catch(() => {});
   
   if (data === "package_test") {
-    userSelections[chatId] = { package: "Test Package", plan: "20 Min Test", price: 1, username: userSelections[chatId]?.username };
+    userSelections[chatId] = { 
+      ...userSelections[chatId],
+      package: "Test Package", 
+      plan: "20 Min Test", 
+      price: 1 
+    };
     saveUserSelection(chatId, userSelections[chatId]);
     return safeSendMessage(chatId,
       `🧪 *Test Mode - 20 Minute Access*\n💰 Cost: Ksh 1\n\nHow would you like to pay?`,
@@ -605,7 +672,10 @@ bot.on("callback_query", async (query) => {
   }
   
   if (data === "package_naughty_premium_leaks") {
-    userSelections[chatId] = { package: "Naughty Premium Leaks", username: userSelections[chatId]?.username };
+    userSelections[chatId] = { 
+      ...userSelections[chatId],
+      package: "Naughty Premium Leaks" 
+    };
     saveUserSelection(chatId, userSelections[chatId]);
     return safeSendMessage(chatId, `🔥 *Naughty Premium Leaks*\n\nSelect plan:`, {
       reply_markup: {
@@ -620,7 +690,10 @@ bot.on("callback_query", async (query) => {
   }
   
   if (data === "package_naughty_explicit") {
-    userSelections[chatId] = { package: "Naughty Explicit", username: userSelections[chatId]?.username };
+    userSelections[chatId] = { 
+      ...userSelections[chatId],
+      package: "Naughty Explicit" 
+    };
     saveUserSelection(chatId, userSelections[chatId]);
     return safeSendMessage(chatId, `💥 *Naughty Explicit*\n\nSelect plan:`, {
       reply_markup: {
@@ -644,7 +717,7 @@ bot.on("callback_query", async (query) => {
     saveUserSelection(chatId, sel);
     
     return safeSendMessage(chatId,
-      `✅ *${sel.package}* — *${plan.label}*\n💰 Ksh *${plan.price}*\n\nHow to pay?`,
+      `✅ *${sel.package || "Package"}* — *${plan.label}*\n💰 Ksh *${plan.price}*\n\nHow would you like to pay?`,
       {
         reply_markup: {
           inline_keyboard: [
@@ -658,7 +731,9 @@ bot.on("callback_query", async (query) => {
   
   if (data === "pay_stk") {
     const sel = userSelections[chatId];
-    if (!sel || !sel.price) return;
+    if (!sel || !sel.price) {
+      return safeSendMessage(chatId, `⚠️ Please select a package first using /start`);
+    }
     userSelections[chatId].awaitingPhone = true;
     saveUserSelection(chatId, userSelections[chatId]);
     return safeSendMessage(chatId, `📱 *Enter your M-Pesa phone number* (e.g., 0712345678):`);
@@ -666,18 +741,26 @@ bot.on("callback_query", async (query) => {
   
   if (data === "show_till") {
     const sel = userSelections[chatId];
-    if (!sel) return;
+    if (!sel || !sel.price) {
+      return safeSendMessage(chatId, `⚠️ Please select a package first using /start`);
+    }
     return safeSendMessage(chatId,
       `💳 *M-Pesa Till Number:* \`${TILL_NUMBER}\`\n📛 *Business:* ${TILL_NAME}\n💰 *Amount:* Ksh ${sel.price}\n\nSend the exact amount and text \`/confirm YOUR_CODE\` after payment.`
     );
   }
   
   if (data === "change_package") {
-    return safeSendMessage(chatId, `🔄 Choose package:`, {
+    // Reset user selection but keep username
+    const username = userSelections[chatId]?.username;
+    userSelections[chatId] = { username: username };
+    saveUserSelection(chatId, userSelections[chatId]);
+    
+    return safeSendMessage(chatId, `🔄 Choose your package:`, {
       reply_markup: {
         inline_keyboard: [
           [{ text: "🔥 Naughty Premium Leaks", callback_data: "package_naughty_premium_leaks" }],
-          [{ text: "💥 Naughty Explicit", callback_data: "package_naughty_explicit" }]
+          [{ text: "💥 Naughty Explicit", callback_data: "package_naughty_explicit" }],
+          [{ text: "🧪 TEST: 20 Min Access (1 KSH)", callback_data: "package_test" }]
         ]
       }
     });
@@ -711,7 +794,7 @@ bot.on("message", async (msg) => {
         await safeSendMessage(chatId, `⚠️ Could not send prompt. Try manual payment.`);
       }
     } catch (err) {
-      await safeSendMessage(chatId, `❌ Invalid number. Try again with /start`);
+      await safeSendMessage(chatId, `❌ Invalid number. Please use /start to try again.`);
     }
     return;
   }
@@ -721,7 +804,15 @@ bot.on("message", async (msg) => {
     const code = text.toUpperCase();
     
     if (sel && sel.paidAt) {
-      return safeSendMessage(chatId, `✅ You already have active access!`);
+      // Check if subscription is still active
+      const subData = loadSubs()[chatId];
+      if (subData && subData.expiresAt > Date.now()) {
+        return safeSendMessage(chatId, `✅ You already have an active subscription! Enjoy the content 😊`);
+      } else {
+        // Clear old paid status to allow new purchase
+        delete sel.paidAt;
+        saveUserSelection(chatId, sel);
+      }
     }
     
     if (!sel || !sel.price) {
@@ -739,11 +830,35 @@ bot.on("message", async (msg) => {
     return;
   }
   
-  // Default response
-  if (sel && !sel.paidAt) {
+  // Check if user has an active subscription before asking for payment
+  const subData = loadSubs()[chatId];
+  if (subData && subData.expiresAt > Date.now()) {
+    // User has active subscription, don't ask for payment
+    const remainingDays = Math.ceil((subData.expiresAt - Date.now()) / (1000 * 60 * 60 * 24));
     await safeSendMessage(chatId,
+      `✨ *You're already subscribed!* ✨\n\n` +
+      `Your *${subData.planLabel}* plan is active with *${remainingDays} day(s)* remaining.\n\n` +
+      `Enjoy the sweet content! 😊\n\n` +
+      `Want to extend or upgrade? Tap below 👇`,
+      {
+        reply_markup: { inline_keyboard: [[{ text: "🔄 Extend / Upgrade", callback_data: "change_package" }]] }
+      }
+    );
+    return;
+  }
+  
+  // Default response for users without selection
+  if (!sel || !sel.price) {
+    await safeSendMessage(chatId,
+      `🎬 *Ready for some sweet content?*\n\n` +
       `Send your *10-character M-Pesa code* (e.g., \`RCX4B2K9QP\`) to get access immediately.\n\n` +
-      `Or use /start to select a package.`
+      `Or tap /start to select a package.`
+    );
+  } else if (!sel.paidAt) {
+    await safeSendMessage(chatId,
+      `💫 *Almost there!*\n\n` +
+      `Send your *10-character M-Pesa code* (e.g., \`RCX4B2K9QP\`) to complete your purchase.\n\n` +
+      `Or tap /start to choose a different package.`
     );
   }
 });
@@ -764,11 +879,13 @@ bot.onText(/\/grant (\d+)(?: (.+))?/, async (msg, match) => {
 
 // ─── STATUS ENDPOINT ──────────────────────────────────────────────────────────
 app.get("/api/status", (req, res) => {
+  const subs = loadSubs();
   res.json({
     status: "online",
     autoApprove: true,
     pendingSTKCount: Object.keys(pendingSTK).length,
     activeSubscriptions: Object.keys(subTimers).length,
+    persistedSubscriptions: Object.keys(subs).length,
     activeSessions: Object.keys(userSelections).length,
     timestamp: new Date().toISOString()
   });
@@ -810,7 +927,9 @@ async function autoVerifyPendingTransactions() {
 
 setInterval(autoVerifyPendingTransactions, 30000);
 
-// ─── EXPRESS SERVER ──────────────────────────────────────────────────────────
+// ─── RESTORE SUBSCRIPTIONS ON STARTUP ─────────────────────────────────────────
+restoreActiveSubscriptions();
+
 // ─── EXPRESS SERVER ──────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
