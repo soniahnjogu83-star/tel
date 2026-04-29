@@ -345,25 +345,28 @@ async function getMpesaToken() {
 //   PartyB            = SHORTCODE
 //   TransactionType   = "CustomerPayBillOnline"
 //   Password          = base64(SHORTCODE + PASSKEY + timestamp)
-// ─── M-PESA: STK PUSH ────────────────────────────────────────────────────────
 async function stkPush(phone, amount, chatId) {
   const id = cid(chatId);
+
   try {
-    const token     = await getMpesaToken();
+    const token = await getMpesaToken();
     const timestamp = moment().format("YYYYMMDDHHmmss");
 
-    // FIX: BusinessShortCode is ALWAYS SHORTCODE (your Daraja-registered shortcode)
-    // PartyB is the receiving end: SHORTCODE for paybill, TILL_NUMBER for buy goods
-    const businessShortCode = SHORTCODE;
-    const partyB            = MPESA_TYPE === "paybill" ? SHORTCODE : TILL_NUMBER;
-    const transactionType   = MPESA_TYPE === "paybill"
+    const isPaybill = MPESA_TYPE === "paybill";
+
+    // ✅ Correct matching of shortcode & PartyB
+    const businessShortCode = isPaybill ? SHORTCODE : TILL_NUMBER;
+    const partyB            = isPaybill ? SHORTCODE : TILL_NUMBER;
+
+    const transactionType = isPaybill
       ? "CustomerPayBillOnline"
       : "CustomerBuyGoodsOnline";
 
-    // Password always uses BusinessShortCode (which is always SHORTCODE)
+    // ✅ Password generation
     const rawPassword = `${businessShortCode}${PASSKEY}${timestamp}`;
-    const password    = Buffer.from(rawPassword).toString("base64");
+    const password = Buffer.from(rawPassword).toString("base64");
 
+    // ✅ Normalize phone
     let normalized;
     try {
       normalized = validatePhone(phone);
@@ -373,31 +376,35 @@ async function stkPush(phone, amount, chatId) {
 
     const amountInt = Math.ceil(Number(amount));
 
-    console.log(`📲 STK Push → ${normalized} | Ksh ${amountInt} | ShortCode: ${businessShortCode} | PartyB: ${partyB} | Type: ${transactionType}`);
+    console.log(`📲 STK Push → ${normalized} | Ksh ${amountInt}`);
+    console.log(`🔧 Type: ${transactionType}`);
+    console.log(`🏢 ShortCode: ${businessShortCode} | PartyB: ${partyB}`);
 
-    // AccountReference ≤12 chars, TransactionDesc ≤13 chars
     const payload = {
       BusinessShortCode: businessShortCode,
-      Password:          password,
-      Timestamp:         timestamp,
-      TransactionType:   transactionType,
-      Amount:            amountInt,
-      PartyA:            normalized,
-      PartyB:            partyB,
-      PhoneNumber:       normalized,
-      CallBackURL:       CALLBACK_URL,
-      AccountReference:  "ALJAKI",
-      TransactionDesc:   "Access",
+      Password: password,
+      Timestamp: timestamp,
+      TransactionType: transactionType,
+      Amount: amountInt,
+      PartyA: normalized,
+      PartyB: partyB,
+      PhoneNumber: normalized,
+      CallBackURL: CALLBACK_URL,
+      AccountReference: "ALJAKI",
+      TransactionDesc: "Access",
     };
 
-    console.log("📤 STK payload (no password):", JSON.stringify({ ...payload, Password: "[REDACTED]" }));
+    console.log("📤 STK payload (safe):", JSON.stringify({
+      ...payload,
+      Password: "[REDACTED]"
+    }));
 
     const res = await axios.post(
       `${DARAJA_BASE_URL}/mpesa/stkpush/v1/processrequest`,
       payload,
       {
         headers: {
-          Authorization:  `Bearer ${token}`,
+          Authorization: `Bearer ${token}`,
           "Content-Type": "application/json",
         },
         timeout: 30000,
@@ -406,37 +413,57 @@ async function stkPush(phone, amount, chatId) {
 
     console.log("📥 STK response:", JSON.stringify(res.data));
 
+    // ✅ Handle response
     if (res.data.ResponseCode === "0") {
-      const sel   = userSelections[id] || {};
+      const sel = userSelections[id] || {};
+
       const entry = {
-        chatId:    id,
-        plan:      sel.plan    || null,
-        pkg:       sel.package || sel.pkg || null,
-        price:     sel.price   || amount,
-        username:  sel.username || id,
-        expiresAt: Date.now() + 10 * 60 * 1000, // 10 min TTL
+        chatId: id,
+        plan: sel.plan || null,
+        pkg: sel.package || sel.pkg || null,
+        price: sel.price || amount,
+        username: sel.username || id,
+        expiresAt: Date.now() + 10 * 60 * 1000, // 10 mins
       };
+
       pendingSTK[res.data.CheckoutRequestID] = entry;
       savePendingSTK(pendingSTK);
-      console.log(`📌 Pending STK registered: ${res.data.CheckoutRequestID} →`, JSON.stringify(entry));
+
+      console.log(`📌 Pending STK registered: ${res.data.CheckoutRequestID}`);
     } else {
-      console.warn(`⚠️ STK non-zero ResponseCode: ${res.data.ResponseCode} — ${res.data.ResponseDescription}`);
+      console.warn(
+        `⚠️ STK failed: ${res.data.ResponseCode} — ${res.data.ResponseDescription}`
+      );
+      throw new Error(res.data.ResponseDescription);
     }
 
     return res.data;
+
   } catch (err) {
-    // If it's already a formatted error from above, just rethrow
     if (err.response) {
-      const status  = err.response.status;
-      const body    = err.response.data;
-      const detail  = body?.errorMessage || body?.ResultDesc || body?.error_description || err.message;
+      const status = err.response.status;
+      const body = err.response.data;
+      const detail =
+        body?.errorMessage ||
+        body?.ResultDesc ||
+        body?.error_description ||
+        err.message;
+
       console.error(`❌ STK HTTP ${status}:`, JSON.stringify(body));
-      notifyAdmins(`🚨 *STK Push HTTP ${status}*\nChat: \`${id}\`\nError: \`${detail}\``);
+
+      notifyAdmins(
+        `🚨 *STK Push HTTP ${status}*\nChat: \`${id}\`\nError: \`${detail}\``
+      );
+
       throw new Error(`STK push failed [HTTP ${status}]: ${detail}`);
     }
-    // Network or other error
+
     console.error("❌ stkPush error:", err.message);
-    notifyAdmins(`🚨 *STK Push Failed*\nChat: \`${id}\`\nError: \`${err.message}\``);
+
+    notifyAdmins(
+      `🚨 *STK Push Failed*\nChat: \`${id}\`\nError: \`${err.message}\``
+    );
+
     throw err;
   }
 }
