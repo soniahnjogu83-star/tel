@@ -27,8 +27,6 @@ const CONSUMER_KEY    = process.env.CONSUMER_KEY;
 const CONSUMER_SECRET = process.env.CONSUMER_SECRET;
 const CALLBACK_URL    = process.env.CALLBACK_URL || "";
 const BOT_TOKEN       = process.env.BOT_TOKEN;
-const RENDER_URL      = process.env.RENDER_EXTERNAL_URL
-  || (CALLBACK_URL ? CALLBACK_URL.replace("/mpesa/callback", null) : null);
 
 // ─── PLAN CONFIG ─────────────────────────────────────────────────────────────
 const PLAN_DAYS = {
@@ -67,50 +65,40 @@ const PLANS = {
   explicit_test:    { label: "20 Min Test", price: 1 },
 };
 
-const USDT_PLANS = [
-  { key: "usdt_1day",    label: "1 Day",    usdt: 5 },
-  { key: "usdt_1week",   label: "1 Week",   usdt: 19 },
-  { key: "usdt_1month",  label: "1 Month",  usdt: 35 },
-  { key: "usdt_6months", label: "6 Months", usdt: 90 },
-  { key: "usdt_1year",   label: "1 Year",   usdt: 250 },
-];
-
 // ─── STATE & UTILS ──────────────────────────────────────────────────────────
-const warnMs         = 24 * 60 * 60 * 1000; // 24 hours
+const warnMs = 24 * 60 * 60 * 1000;
 
 const userSelections = {};
-let pendingSTK        = {};
-let pendingManualApprovals = {}; // Store manual approval requests
-const reminderTimers  = {};
-const subTimers       = {};
-const accessAttempts  = {}; // Track attempts to prevent duplicate errors
+let pendingSTK = {};
+let pendingManualApprovals = {};
+const subTimers = {};
+const accessAttempts = {};
+const userInviteLinks = {};
 
 let autoExpireSubscriptions = true;
-let autoSendInvite          = true;
 
 // ─── CHANNEL_ID ──────────────────────────────────────────────────────────────
 const CHANNEL_ID = -1001567081082;
 
-// ─── BOT: LONG POLLING (with webhook cleanup) ────────────────────────────────
+// ─── BOT: LONG POLLING ────────────────────────────────────────────────────────
 const bot = new TelegramBot(BOT_TOKEN, { polling: false });
 
 (async () => {
   try {
     await bot.deleteWebHook({ drop_pending_updates: true });
-    console.log("✅ Webhook deleted (any old webhook is now cleared).");
+    console.log("✅ Webhook cleared");
   } catch (err) {
-    console.warn("⚠️  Could not delete webhook (may not have existed):", err.message);
+    console.warn("⚠️ Could not delete webhook:", err.message);
   }
 
   await new Promise((r) => setTimeout(r, 1500));
-
   bot.startPolling({ interval: 1000, params: { timeout: 10 } });
   console.log("✅ Bot started in long-polling mode.");
 })();
 
 bot.on("polling_error", (err) => {
   if (err.code === "ETELEGRAM" && err.message.includes("409")) {
-    console.warn("⚠️  Polling 409 — waiting for Telegram to settle...");
+    console.warn("⚠️ Polling 409 — waiting for Telegram to settle...");
   } else {
     console.error("❌ Polling error:", err.message);
   }
@@ -119,86 +107,62 @@ bot.on("polling_error", (err) => {
 // ─── LOAD PERSISTED DATA ────────────────────────────────────────────────────
 function loadPendingSTK() {
   try {
-    const PENDING_STK_FILE = path.join(__dirname, "pending_stk.json");
-    if (fs.existsSync(PENDING_STK_FILE)) {
-      return JSON.parse(fs.readFileSync(PENDING_STK_FILE, "utf8"));
-    }
-  } catch (e) {
-    console.error("⚠️ Could not load pending_stk.json:", e.message);
-  }
+    const file = path.join(__dirname, "pending_stk.json");
+    if (fs.existsSync(file)) return JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch (e) { console.error("⚠️ Could not load pending_stk.json:", e.message); }
   return {};
 }
 
 function savePendingSTK(data) {
   try {
-    const PENDING_STK_FILE = path.join(__dirname, "pending_stk.json");
-    fs.writeFileSync(PENDING_STK_FILE, JSON.stringify(data, null, 2));
-  } catch (e) {
-    console.error("⚠️ Could not save pending_stk.json:", e.message);
-  }
+    fs.writeFileSync(path.join(__dirname, "pending_stk.json"), JSON.stringify(data, null, 2));
+  } catch (e) { console.error("⚠️ Could not save pending_stk.json:", e.message); }
 }
 
 function loadUserSelections() {
   try {
-    const USER_SEL_FILE = path.join(__dirname, "user_selections.json");
-    if (fs.existsSync(USER_SEL_FILE)) {
-      return JSON.parse(fs.readFileSync(USER_SEL_FILE, "utf8"));
-    }
-  } catch (e) {
-    console.error("⚠️ Could not load user_selections.json:", e.message);
-  }
+    const file = path.join(__dirname, "user_selections.json");
+    if (fs.existsSync(file)) return JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch (e) { console.error("⚠️ Could not load user_selections.json:", e.message); }
   return {};
 }
 
 function saveUserSelection(chatId, data) {
   try {
-    const USER_SEL_FILE = path.join(__dirname, "user_selections.json");
     const all = loadUserSelections();
     all[cid(chatId)] = data;
-    fs.writeFileSync(USER_SEL_FILE, JSON.stringify(all, null, 2));
-  } catch (e) {
-    console.error("⚠️ Could not save user_selections.json:", e.message);
-  }
+    fs.writeFileSync(path.join(__dirname, "user_selections.json"), JSON.stringify(all, null, 2));
+  } catch (e) { console.error("⚠️ Could not save user_selections.json:", e.message); }
 }
 
 function deleteUserSelection(chatId) {
   try {
-    const USER_SEL_FILE = path.join(__dirname, "user_selections.json");
     const all = loadUserSelections();
     delete all[cid(chatId)];
-    fs.writeFileSync(USER_SEL_FILE, JSON.stringify(all, null, 2));
-  } catch (e) {
-    console.error("⚠️ Could not delete user_selections.json entry:", e.message);
-  }
+    fs.writeFileSync(path.join(__dirname, "user_selections.json"), JSON.stringify(all, null, 2));
+  } catch (e) { console.error("⚠️ Could not delete user_selections.json entry:", e.message); }
 }
 
 function loadSubs() {
   try {
-    const SUBS_FILE = path.join(__dirname, "subscriptions.json");
-    if (fs.existsSync(SUBS_FILE)) {
-      return JSON.parse(fs.readFileSync(SUBS_FILE, "utf8"));
-    }
-  } catch (e) {
-    console.error("⚠️ Could not load subscriptions.json:", e.message);
-  }
+    const file = path.join(__dirname, "subscriptions.json");
+    if (fs.existsSync(file)) return JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch (e) { console.error("⚠️ Could not load subscriptions.json:", e.message); }
   return {};
 }
 
 function saveSubs(data) {
   try {
-    const SUBS_FILE = path.join(__dirname, "subscriptions.json");
-    fs.writeFileSync(SUBS_FILE, JSON.stringify(data, null, 2));
-  } catch (e) {
-    console.error("⚠️ Could not save subscriptions.json:", e.message);
-  }
+    fs.writeFileSync(path.join(__dirname, "subscriptions.json"), JSON.stringify(data, null, 2));
+  } catch (e) { console.error("⚠️ Could not save subscriptions.json:", e.message); }
 }
 
 pendingSTK = loadPendingSTK();
 Object.assign(userSelections, loadUserSelections());
 
-function saveSubEntry(chatId, planLabel, expiresAt, username) {
+function saveSubEntry(chatId, planLabel, expiresAt, username, inviteLink = null, inviteLinkId = null) {
   const data = loadSubs();
-  data[cid(chatId)] = { planLabel, expiresAt, username };
+  data[cid(chatId)] = { planLabel, expiresAt, username, inviteLink, inviteLinkId };
   saveSubs(data);
 }
 
@@ -208,7 +172,6 @@ function removeSubEntry(chatId) {
   saveSubs(data);
 }
 
-// ─── HELPERS: normalize chatId to string always ───────────────────────────────
 const cid = (id) => String(id);
 
 function logError(label, err) {
@@ -230,35 +193,84 @@ function validatePhone(phone) {
   return cleaned;
 }
 
+// ─── CRITICAL: AUTO REMOVE USER FROM CHANNEL ON EXPIRY ────────────────────────
 async function removeUserFromChannel(chatId, reason = "") {
-  console.log(`🚪 Removing user ${chatId} from channel. Reason: ${reason}`);
+  console.log(`🔴 ATTEMPTING TO REMOVE USER ${chatId} from channel. Reason: ${reason}`);
+  
   try {
-    await bot.banChatMember(CHANNEL_ID, Number(chatId));
-    await bot.unbanChatMember(CHANNEL_ID, Number(chatId));
-    console.log(`✅ User ${chatId} removed successfully`);
+    // Method 1: Ban the user (this removes them from the channel/group)
+    const banResult = await bot.banChatMember(CHANNEL_ID, Number(chatId));
+    console.log(`   Ban result: ${banResult ? "Success" : "Failed"}`);
+    
+    // Wait a moment for the ban to take effect
+    await new Promise(r => setTimeout(r, 1000));
+    
+    // Method 2: Unban to allow them to rejoin later with a new purchase
+    const unbanResult = await bot.unbanChatMember(CHANNEL_ID, Number(chatId));
+    console.log(`   Unban result: ${unbanResult ? "Success" : "Failed"}`);
+    
+    // Method 3: Also try to restrict permissions as backup
+    try {
+      await bot.restrictChatMember(CHANNEL_ID, Number(chatId), {
+        can_send_messages: false,
+        can_send_media_messages: false,
+        can_send_other_messages: false,
+        can_add_web_page_previews: false
+      });
+      console.log(`   Restricted permissions for ${chatId}`);
+    } catch (restrictErr) {
+      console.log(`   Restriction not needed (already banned): ${restrictErr.message}`);
+    }
+    
+    // Method 4: Revoke any invite links for this user
+    if (userInviteLinks[chatId]) {
+      try {
+        await bot.revokeChatInviteLink(CHANNEL_ID, userInviteLinks[chatId]);
+        console.log(`   Revoked invite link for ${chatId}`);
+      } catch (linkErr) {
+        console.log(`   Could not revoke link: ${linkErr.message}`);
+      }
+      delete userInviteLinks[chatId];
+    }
+    
+    console.log(`✅ SUCCESS: User ${chatId} has been removed from channel`);
+    return true;
+    
   } catch (err) {
-    logError(`removeUserFromChannel [${chatId}]`, err);
+    console.error(`❌ FAILED to remove user ${chatId}:`, err.message);
+    
+    // If ban fails, try kicking
+    try {
+      await bot.kickChatMember(CHANNEL_ID, Number(chatId));
+      console.log(`   Kick successful for ${chatId}`);
+      await new Promise(r => setTimeout(r, 1000));
+      await bot.unbanChatMember(CHANNEL_ID, Number(chatId));
+      console.log(`✅ User ${chatId} kicked successfully`);
+      return true;
+    } catch (kickErr) {
+      console.error(`   Kick also failed: ${kickErr.message}`);
+      return false;
+    }
   }
 }
 
-// ─── TYPING INDICATOR ────────────────────────────────────────────────────────
-async function sendTyping(chatId, durationMs = 1500) {
+async function revokeUserInviteLink(chatId, inviteLinkId) {
+  if (!inviteLinkId) return;
   try {
-    await bot.sendChatAction(cid(chatId), "typing");
-    await new Promise((r) => setTimeout(r, durationMs));
+    await bot.revokeChatInviteLink(CHANNEL_ID, inviteLinkId);
+    console.log(`✅ Revoked invite link for user ${chatId}`);
   } catch (err) {
-    logError("sendTyping", err);
+    console.error(`❌ Failed to revoke invite link:`, err.message);
   }
 }
 
-// ─── GRANT ACCESS ────────────────────────────────────────────────────────────
+// ─── GRANT ACCESS WITH AUTO-REMOVAL ON EXPIRY ─────────────────────────────────
 async function grantAccess(rawChatId, planLabel, paymentSummary, isManualApproval = false) {
   const chatId = cid(rawChatId);
   console.log(`🔍 grantAccess called: chatId=${chatId}, planLabel="${planLabel}"`);
 
-  // Prevent duplicate attempts
   if (accessAttempts[chatId]) {
-    console.log(`⚠️ Grant access already in progress for ${chatId}, skipping duplicate`);
+    console.log(`⚠️ Grant access already in progress for ${chatId}`);
     return;
   }
   accessAttempts[chatId] = true;
@@ -267,176 +279,148 @@ async function grantAccess(rawChatId, planLabel, paymentSummary, isManualApprova
   const resolvedLabel = PLAN_DAYS[planLabel] !== undefined ? planLabel : "1 Month";
   const days = PLAN_DAYS[resolvedLabel];
   
-  if (!days || isNaN(days)) {
-    console.error(`❌ grantAccess: could not resolve days for plan "${planLabel}"`);
+  if (!days && days !== 0) {
+    console.error(`❌ Could not resolve days for plan "${planLabel}"`);
     delete accessAttempts[chatId];
     return;
   }
 
-  // Get username for storage
   const username = userSelections[chatId]?.username || `User ${chatId}`;
 
   try {
-    // Verify bot has channel permissions first
-    try {
-      const botMember = await bot.getChatMember(CHANNEL_ID, (await bot.getMe()).id);
-      if (!["administrator", "creator"].includes(botMember.status)) {
-        throw new Error("Bot is not an admin in the channel");
-      }
-    } catch (permErr) {
-      console.error("❌ Bot permission check failed:", permErr.message);
-      await safeSendMessage(chatId,
-        `⚠️ *Configuration Error*\n\n` +
-        `The bot is not properly configured as an admin in the channel.\n\n` +
-        `Please contact support.`,
-        { parse_mode: "Markdown" }
-      );
-      delete accessAttempts[chatId];
-      return;
-    }
-
-    // Pre-kick user if they're already in channel
+    // Clear any existing subscription timers first
+    clearSubTimers(chatId);
+    
+    // Remove user from channel if they're already there (clean state)
     try {
       const member = await bot.getChatMember(CHANNEL_ID, Number(chatId));
-      const isAdmin = ["administrator", "creator"].includes(member.status);
-      if (!isAdmin && member.status !== "left" && member.status !== "kicked") {
-        await bot.banChatMember(CHANNEL_ID, Number(chatId));
-        await bot.unbanChatMember(CHANNEL_ID, Number(chatId));
-        console.log(`🔄 Pre-kick done for ${chatId}`);
+      if (member.status !== "left" && member.status !== "kicked") {
+        console.log(`🔄 Removing existing user ${chatId} before granting new access`);
+        await removeUserFromChannel(chatId, "pre-clean before new subscription");
+        await new Promise(r => setTimeout(r, 2000));
       }
-    } catch (preKickErr) {
-      console.log(`ℹ️ Pre-kick skipped for ${chatId}: ${preKickErr.message}`);
+    } catch (err) {
+      console.log(`ℹ️ Could not check member status: ${err.message}`);
     }
 
     const nowMs = Date.now();
-    let durationMs, expiresAtMs, inviteExpiry;
+    let durationMs, expiresAtMs;
     
-    // Handle different plan durations
     if (resolvedLabel === "20 Min Test") {
       durationMs = 20 * 60 * 1000;
-      expiresAtMs = nowMs + durationMs;
-      inviteExpiry = Math.floor(expiresAtMs / 1000);
     } else if (resolvedLabel === "1 Hour") {
       durationMs = 60 * 60 * 1000;
-      expiresAtMs = nowMs + durationMs;
-      inviteExpiry = Math.floor(expiresAtMs / 1000);
     } else if (resolvedLabel === "6 Hours") {
       durationMs = 6 * 60 * 60 * 1000;
-      expiresAtMs = nowMs + durationMs;
-      inviteExpiry = Math.floor(expiresAtMs / 1000);
     } else {
       durationMs = days * 24 * 60 * 60 * 1000;
-      expiresAtMs = nowMs + durationMs;
-      inviteExpiry = Math.floor(expiresAtMs / 1000);
     }
+    expiresAtMs = nowMs + durationMs;
 
-    console.log(`⏱ Plan: ${resolvedLabel} | durationMs: ${durationMs}`);
-    console.log(`📅 Expires: ${new Date(expiresAtMs).toISOString()}`);
-    console.log(`🔗 Creating invite link...`);
+    console.log(`⏱ Plan: ${resolvedLabel} | Duration: ${durationMs}ms`);
+    console.log(`📅 Expires at: ${new Date(expiresAtMs).toISOString()}`);
 
+    // Create invite link that expires with subscription
     const inviteRes = await bot.createChatInviteLink(CHANNEL_ID, {
       member_limit: 1,
-      expire_date: inviteExpiry,
-      name: `Access-${chatId}-${Date.now()}`
+      expire_date: Math.floor(expiresAtMs / 1000),
+      name: `Sub-${chatId}-${Date.now()}`
     });
 
     const inviteLink = inviteRes.invite_link;
-    console.log(`✅ Invite link created: ${inviteLink}`);
+    const inviteLinkId = inviteRes.invite_link_id;
+    userInviteLinks[chatId] = inviteLinkId;
 
-    // Send the invite link immediately
-    let dayText = resolvedLabel;
-    if (resolvedLabel === "20 Min Test") dayText = "20 minutes";
-    else if (resolvedLabel === "1 Hour") dayText = "1 hour";
-    else if (resolvedLabel === "6 Hours") dayText = "6 hours";
-    else dayText = `${days} day(s)`;
+    let timeText = resolvedLabel;
+    if (resolvedLabel === "20 Min Test") timeText = "20 minutes";
+    else if (resolvedLabel === "1 Hour") timeText = "1 hour";
+    else if (resolvedLabel === "6 Hours") timeText = "6 hours";
+    else if (resolvedLabel === "1 Day") timeText = "1 day";
+    else timeText = `${days} day(s)`;
     
     await safeSendMessage(chatId,
-      `🎉 *Access Granted!*\n\n` +
-      `${paymentSummary}\n\n` +
-      `👇 *Tap the link below to join the channel:*\n${inviteLink}\n\n` +
-      `⚠️ *Important:*\n` +
-      `• This link is *single-use* — it works for you only\n` +
-      `• Once you join the channel, the link expires automatically\n` +
-      `• Your access expires in *${dayText}*\n\n` +
-      `_Welcome to the family!_ 🔐`,
-      { parse_mode: "Markdown", disable_web_page_preview: false }
+      `🎉 *Access Granted!*\n\n${paymentSummary}\n\n` +
+      `👇 *Tap to join:*\n${inviteLink}\n\n` +
+      `⚠️ *You will be automatically removed from the channel after ${timeText}*`,
+      { disable_web_page_preview: false }
     );
-    console.log(`📨 Invite link sent to ${chatId}`);
 
-    // Set up auto-expiry
-    if (autoExpireSubscriptions) {
-      clearSubTimers(chatId);
+    // ─── CRITICAL: SET UP AUTO-REMOVAL TIMER ─────────────────────────────────
+    console.log(`⏰ Setting expiry timer for ${chatId} in ${durationMs}ms (${new Date(expiresAtMs).toLocaleString()})`);
+    
+    const kickTimer = setTimeout(async () => {
+      console.log(`🔴🚨 EXPIRY TRIGGERED for ${chatId} at ${new Date().toISOString()}`);
       
-      const kickTimer = setTimeout(async () => {
-        try {
-          await removeUserFromChannel(chatId, "plan expiry");
-          console.log(`🚪 User ${chatId} removed after ${resolvedLabel} plan expiry`);
-          
-          // Send personalized expiry message with user's name
-          await safeSendMessage(chatId,
-            `Dear *${username}*, your sweet subscription moment is over. Looks like your sweet moment just timed out ⏳\n\nTap below to resubscribe and see the new uploads 👇`,
-            {
-              parse_mode: "Markdown",
-              reply_markup: { inline_keyboard: [[{ text: "🔄 Resubscribe Now", callback_data: "change_package" }]] }
-            }
-          );
-        } catch (e) {
-          console.error("Kick error:", e.message);
+      // Multiple removal attempts for reliability
+      let removed = false;
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        console.log(`   Removal attempt ${attempt} for ${chatId}`);
+        const result = await removeUserFromChannel(chatId, `EXPIRED: ${resolvedLabel} plan (attempt ${attempt})`);
+        if (result) {
+          removed = true;
+          break;
         }
-        delete subTimers[chatId];
-        removeSubEntry(chatId);
-      }, durationMs);
-      
-      // Send warning for longer plans (not needed for short plans)
-      let warnTimer = null;
-      if (resolvedLabel !== "20 Min Test" && resolvedLabel !== "1 Hour" && resolvedLabel !== "6 Hours" && days > 1 && durationMs > warnMs) {
-        warnTimer = setTimeout(() => {
-          safeSendMessage(chatId,
-            `⏰ *Heads up, ${username}!*\n\nYour *${resolvedLabel}* access expires in *24 hours*.\n\nRenew now to stay connected 😊`,
-            {
-              parse_mode: "Markdown",
-              reply_markup: { inline_keyboard: [[{ text: "🔄 Renew My Access", callback_data: "change_package" }]] }
-            }
-          ).catch(() => {});
-        }, durationMs - warnMs);
+        await new Promise(r => setTimeout(r, 2000 * attempt));
       }
       
-      subTimers[chatId] = { expiresAt: expiresAtMs, kickTimer, warnTimer };
-      saveSubEntry(chatId, resolvedLabel, expiresAtMs, username);
+      if (removed) {
+        console.log(`✅ User ${chatId} successfully removed after ${resolvedLabel} expiry`);
+      } else {
+        console.log(`⚠️ Could not remove ${chatId} after 3 attempts`);
+      }
+      
+      // Revoke invite link
+      await revokeUserInviteLink(chatId, inviteLinkId);
+      
+      // Send expiry notification
+      await safeSendMessage(chatId,
+        `⏰ *Subscription Expired*\n\n` +
+        `Your *${resolvedLabel}* access has ended.\n\n` +
+        `Tap below to renew 👇`,
+        {
+          reply_markup: { inline_keyboard: [[{ text: "🔄 Renew Subscription", callback_data: "change_package" }]] }
+        }
+      );
+      
+      delete subTimers[chatId];
+      removeSubEntry(chatId);
+      delete userInviteLinks[chatId];
+    }, durationMs);
+    
+    // Set up 24-hour warning for long plans
+    let warnTimer = null;
+    const shouldWarn = !["20 Min Test", "1 Hour", "6 Hours", "1 Day"].includes(resolvedLabel) && durationMs > warnMs;
+    
+    if (shouldWarn) {
+      warnTimer = setTimeout(() => {
+        safeSendMessage(chatId,
+          `⏰ *Reminder!*\n\nYour *${resolvedLabel}* subscription expires in *24 hours*.\n\nRenew to continue enjoying the content!`,
+          { reply_markup: { inline_keyboard: [[{ text: "🔄 Renew Now", callback_data: "change_package" }]] } }
+        );
+      }, durationMs - warnMs);
     }
-
-    console.log(`✅ Access fully set up for ${chatId} | ${resolvedLabel}`);
+    
+    subTimers[chatId] = { expiresAt: expiresAtMs, kickTimer, warnTimer, inviteLinkId, plan: resolvedLabel };
+    saveSubEntry(chatId, resolvedLabel, expiresAtMs, username, inviteLink, inviteLinkId);
+    
+    console.log(`✅ Access setup complete for ${chatId}`);
+    console.log(`   Timer will fire at: ${new Date(expiresAtMs).toLocaleString()}`);
     delete accessAttempts[chatId];
 
-    // Clean up manual approval if this was from one
-    if (isManualApproval) {
-      delete pendingManualApprovals[chatId];
-    }
+    if (isManualApproval) delete pendingManualApprovals[chatId];
 
   } catch (err) {
-    console.error("❌ grantAccess error:", err.message);
+    console.error("❌ grantAccess error:", err.message, err.stack);
     
-    // Only send error message once per user
-    if (!accessAttempts[`${chatId}_error`]) {
-      accessAttempts[`${chatId}_error`] = true;
-      setTimeout(() => { delete accessAttempts[`${chatId}_error`]; }, 60000);
-      
-      await safeSendMessage(chatId,
-        `✅ *Payment Received!*\n\n` +
-        `Your payment has been confirmed, but we're having a small technical issue.\n\n` +
-        `*Don't worry!* An admin has been notified and will send your access link within 5 minutes. 🙏\n\n` +
-        `Thank you for your patience! 💛`,
-        { parse_mode: "Markdown" }
-      );
-      
-      notifyAdmins(
-        `⚠️ *Auto-invite FAILED for* \`${chatId}\`\n\n` +
-        `Plan: *${resolvedLabel}*\n` +
-        `Error: \`${err.message}\`\n\n` +
-        `Please grant access manually using:\n` +
-        `/grant ${chatId} "${resolvedLabel}"`
-      );
-    }
+    await safeSendMessage(chatId,
+      `✅ *Payment Received!*\n\n` +
+      `Having technical issues. Admin notified and will send your access link within 5 minutes.`
+    );
+    
+    notifyAdmins(
+      `⚠️ *Auto-invite FAILED for* \`${chatId}\`\nPlan: ${resolvedLabel}\nError: ${err.message}\n` +
+      `Use: /grant ${chatId} "${resolvedLabel}"`
+    );
     delete accessAttempts[chatId];
   }
 }
@@ -444,6 +428,7 @@ async function grantAccess(rawChatId, planLabel, paymentSummary, isManualApprova
 function clearSubTimers(chatId) {
   const id = cid(chatId);
   if (subTimers[id]) {
+    console.log(`🧹 Clearing timers for ${id}`);
     if (subTimers[id].kickTimer) clearTimeout(subTimers[id].kickTimer);
     if (subTimers[id].warnTimer) clearTimeout(subTimers[id].warnTimer);
     delete subTimers[id];
@@ -451,11 +436,9 @@ function clearSubTimers(chatId) {
   }
 }
 
-// ─── NOTIFY ADMINS ───────────────────────────────────────────────────────────
 function notifyAdmins(message, opts = {}) {
   ADMIN_IDS.forEach((id) => {
-    safeSendMessage(id, message, { parse_mode: "Markdown", ...opts })
-      .catch((err) => console.error(`❌ Admin notify failed [${id}]: ${err.message}`));
+    safeSendMessage(id, message, { parse_mode: "Markdown", ...opts });
   });
 }
 
@@ -463,197 +446,138 @@ function notifyAdmins(message, opts = {}) {
 async function restoreActiveSubscriptions() {
   const subs = loadSubs();
   const now = Date.now();
+  console.log(`🔄 Restoring ${Object.keys(subs).length} subscriptions...`);
   
   for (const [chatId, sub] of Object.entries(subs)) {
     if (sub.expiresAt > now) {
       const remainingMs = sub.expiresAt - now;
-      const resolvedLabel = sub.planLabel;
-      const username = sub.username || `User ${chatId}`;
-      
-      console.log(`🔄 Restoring subscription for ${chatId} (${resolvedLabel}), ${remainingMs}ms remaining`);
+      console.log(`🔄 Restoring ${chatId}: ${sub.planLabel}, ${Math.floor(remainingMs/1000/60)} min remaining`);
       
       const kickTimer = setTimeout(async () => {
-        try {
-          await removeUserFromChannel(chatId, "plan expiry (restored)");
-          await safeSendMessage(chatId,
-            `Dear *${username}*, your sweet subscription moment is over. Looks like your sweet moment just timed out ⏳\n\nTap below to resubscribe and see the new uploads 👇`,
-            {
-              parse_mode: "Markdown",
-              reply_markup: { inline_keyboard: [[{ text: "🔄 Resubscribe Now", callback_data: "change_package" }]] }
-            }
-          );
-        } catch (e) {
-          console.error("Restored kick error:", e.message);
-        }
+        console.log(`🔴 EXPIRED (restored): ${chatId}`);
+        await removeUserFromChannel(chatId, `EXPIRED: ${sub.planLabel}`);
+        if (sub.inviteLinkId) await revokeUserInviteLink(chatId, sub.inviteLinkId);
+        await safeSendMessage(chatId, `⏰ Your *${sub.planLabel}* subscription has expired. Tap /start to renew.`);
         delete subTimers[chatId];
         removeSubEntry(chatId);
       }, remainingMs);
       
-      // Set up warning timer if needed
-      let warnTimer = null;
-      let durationMs;
-      if (resolvedLabel === "20 Min Test") durationMs = 20 * 60 * 1000;
-      else if (resolvedLabel === "1 Hour") durationMs = 60 * 60 * 1000;
-      else if (resolvedLabel === "6 Hours") durationMs = 6 * 60 * 60 * 1000;
-      else durationMs = PLAN_DAYS[resolvedLabel] * 24 * 60 * 60 * 1000;
-      
-      if (resolvedLabel !== "20 Min Test" && resolvedLabel !== "1 Hour" && resolvedLabel !== "6 Hours" && PLAN_DAYS[resolvedLabel] > 1 && remainingMs > warnMs) {
-        warnTimer = setTimeout(() => {
-          safeSendMessage(chatId,
-            `⏰ *Heads up, ${username}!*\n\nYour *${resolvedLabel}* access expires in *24 hours*.\n\nRenew now to stay connected 😊`,
-            {
-              parse_mode: "Markdown",
-              reply_markup: { inline_keyboard: [[{ text: "🔄 Renew My Access", callback_data: "change_package" }]] }
-            }
-          ).catch(() => {});
-        }, remainingMs - warnMs);
-      }
-      
-      subTimers[chatId] = { expiresAt: sub.expiresAt, kickTimer, warnTimer };
+      subTimers[chatId] = { expiresAt: sub.expiresAt, kickTimer, inviteLinkId: sub.inviteLinkId, plan: sub.planLabel };
+      if (sub.inviteLinkId) userInviteLinks[chatId] = sub.inviteLinkId;
     } else {
-      // Subscription already expired, remove the user
       console.log(`🗑️ Removing expired subscription for ${chatId}`);
       removeSubEntry(chatId);
       await removeUserFromChannel(chatId, "expired on startup");
     }
   }
+  console.log(`✅ Restored ${Object.keys(subTimers).length} active subscriptions`);
 }
 
-// ─── M-PESA: GET ACCESS TOKEN ─────────────────────────────────────────────────
+// ─── M-PESA FUNCTIONS ────────────────────────────────────────────────────────
 async function getMpesaToken() {
   try {
-    const auth = Buffer.from(`${CONSUMER_KEY}:${CONSUMER_SECRET}`).toString("base64");
-    const res  = await axios.get(
+    const auth = Buffer.from(`${process.env.CONSUMER_KEY}:${process.env.CONSUMER_SECRET}`).toString("base64");
+    const res = await axios.get(
       "https://api.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials",
       { headers: { Authorization: `Basic ${auth}` } }
     );
     return res.data.access_token;
   } catch (err) {
-    notifyAdmins(`🚨 *Daraja Token Error*\n\`${err.response?.data?.errorMessage || err.message}\``);
+    notifyAdmins(`🚨 Daraja Token Error: ${err.message}`);
     throw err;
   }
 }
 
-// ─── M-PESA: STK PUSH ────────────────────────────────────────────────────────
 async function stkPush(phone, amount, chatId) {
   const id = cid(chatId);
   try {
-    const token     = await getMpesaToken();
+    const token = await getMpesaToken();
     const timestamp = moment().format("YYYYMMDDHHmmss");
-    const password  = Buffer.from(`${SHORTCODE}${PASSKEY}${timestamp}`).toString("base64");
-
+    const password = Buffer.from(`${SHORTCODE}${PASSKEY}${timestamp}`).toString("base64");
     let normalized = phone.trim().replace(/^\+/, "").replace(/^0/, "254");
-
-    if (!/^2547\d{8}$|^2541\d{8}$/.test(normalized)) {
-      throw new Error(`Invalid phone format: ${normalized}`);
-    }
 
     const payload = {
       BusinessShortCode: SHORTCODE,
-      Password:          password,
-      Timestamp:         timestamp,
-      TransactionType:   "CustomerBuyGoodsOnline",
-      Amount:            Math.ceil(Number(amount)),
-      PartyA:            normalized,
-      PartyB:            TILL_NUMBER,
-      PhoneNumber:       normalized,
-      CallBackURL:       CALLBACK_URL,
-      AccountReference:  "ALJAKI",
-      TransactionDesc:   "Content Access"
+      Password: password,
+      Timestamp: timestamp,
+      TransactionType: "CustomerBuyGoodsOnline",
+      Amount: Math.ceil(Number(amount)),
+      PartyA: normalized,
+      PartyB: TILL_NUMBER,
+      PhoneNumber: normalized,
+      CallBackURL: CALLBACK_URL,
+      AccountReference: "ALJAKI",
+      TransactionDesc: "Content Access"
     };
 
     const res = await axios.post(
       "https://api.safaricom.co.ke/mpesa/stkpush/v1/processrequest",
       payload,
-      { headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" } }
+      { headers: { Authorization: `Bearer ${token}` } }
     );
 
     if (res.data.ResponseCode === "0") {
       const sel = userSelections[id] || {};
-      const entry = {
-        chatId:   id,
-        plan:     sel.plan    || null,
-        pkg:      sel.package || null,
-        price:    sel.price   || amount,
-        username: sel.username || id,
-        expiresAt: Date.now() + (10 * 60 * 1000),
+      pendingSTK[res.data.CheckoutRequestID] = {
+        chatId: id, plan: sel.plan, pkg: sel.package, price: sel.price || amount,
+        username: sel.username || id, expiresAt: Date.now() + 10 * 60 * 1000
       };
-      pendingSTK[res.data.CheckoutRequestID] = entry;
       savePendingSTK(pendingSTK);
-      console.log(`📌 Registered pending STK: ${res.data.CheckoutRequestID}`);
     }
     return res.data;
   } catch (err) {
-    notifyAdmins(`🚨 *STK Push Failed*\nChat ID: \`${id}\`\nError: \`${err.message}\``);
+    notifyAdmins(`🚨 STK Push Failed for ${id}: ${err.message}`);
     throw err;
   }
 }
 
-// ─── M-PESA CALLBACK ─────────────────────────────────────────────────────────
 app.post("/mpesa/callback", (req, res) => {
   res.status(200).json({ ResultCode: 0, ResultDesc: "Accepted" });
-  console.log("📩 M-PESA CALLBACK RECEIVED");
-
   try {
-    const body    = req.body?.Body?.stkCallback;
+    const body = req.body?.Body?.stkCallback;
     const checkId = body?.CheckoutRequestID;
-    const code    = body?.ResultCode;
-
     const pending = pendingSTK[checkId];
     if (!pending) return;
-
+    
     delete pendingSTK[checkId];
     savePendingSTK(pendingSTK);
     
-    const { chatId, plan, pkg, price } = pending;
-    const id = cid(chatId);
-
-    if (code === 0) {
+    if (body?.ResultCode === 0) {
       const meta = body.CallbackMetadata?.Item || [];
-      const get = (name) => meta.find((i) => i.Name === name)?.Value ?? "—";
+      const get = (name) => meta.find(i => i.Name === name)?.Value ?? "—";
       const amount = get("Amount");
       const mpesaCode = get("MpesaReceiptNumber");
-      const phone = get("PhoneNumber");
-
-      const sel = userSelections[id] || {};
+      
+      const sel = userSelections[pending.chatId] || {};
       sel.paidAt = new Date().toISOString();
       sel.stkRef = mpesaCode;
-      if (!sel.plan && plan) sel.plan = plan;
-      if (!sel.package && pkg) sel.package = pkg;
-      userSelections[id] = sel;
-      saveUserSelection(id, sel);
-
-      const finalPlan = sel.plan || plan || "1 Month";
+      userSelections[pending.chatId] = sel;
+      saveUserSelection(pending.chatId, sel);
       
-      grantAccess(id, finalPlan, `✅ Ksh *${amount}* received via M-Pesa\n🧾 Ref: \`${mpesaCode}\``);
-      notifyAdmins(`💰 *PAYMENT CONFIRMED (STK)*\n👤 \`${id}\`\n💰 Ksh ${amount} | 🧾 \`${mpesaCode}\``);
+      grantAccess(pending.chatId, sel.plan || "1 Month", `✅ Ksh ${amount} received\nRef: ${mpesaCode}`);
+      notifyAdmins(`💰 Payment: ${pending.chatId} | Ksh ${amount} | ${mpesaCode}`);
     }
   } catch (err) {
-    console.error("STK Callback error:", err.message);
+    console.error("Callback error:", err.message);
   }
 });
 
-// ─── /start ──────────────────────────────────────────────────────────────────
+// ─── BOT COMMANDS ────────────────────────────────────────────────────────────
 bot.onText(/\/start/, async (msg) => {
   const chatId = cid(msg.chat.id);
   const username = msg.from.username ? `@${msg.from.username}` : msg.from.first_name;
   
-  // Reset user selection completely when /start is used
-  userSelections[chatId] = {
-    username: username,
-    freshStart: true
-  };
+  userSelections[chatId] = { username, freshStart: true };
   saveUserSelection(chatId, userSelections[chatId]);
 
   await safeSendMessage(chatId,
-    `🎉 *Welcome back, ${username}!* 🎉\n\n` +
-    `Ready for some sweet content? Select your package below 👇`,
+    `🎉 *Welcome ${username}!* 🎉\n\nSelect your package:`,
     {
       reply_markup: {
         inline_keyboard: [
-          [{ text: "🔥 Premium (Naughty Premium Leaks)", callback_data: "package_premium" }],
-          [{ text: "💥 Explicit (Naughty Explicit)", callback_data: "package_explicit" }],
-          [{ text: "🧪 TEST: 20 Min Access (1 KSH)", callback_data: "package_test" }]
+          [{ text: "🔥 Premium", callback_data: "package_premium" }],
+          [{ text: "💥 Explicit", callback_data: "package_explicit" }],
+          [{ text: "🧪 TEST: 20 Min (1 KSH)", callback_data: "package_test" }]
         ]
       }
     }
@@ -661,273 +585,133 @@ bot.onText(/\/start/, async (msg) => {
 });
 
 bot.onText(/\/myid/, (msg) => {
-  safeSendMessage(cid(msg.chat.id), `🆔 Your Chat ID: \`${msg.chat.id}\``, { parse_mode: "Markdown" });
+  safeSendMessage(cid(msg.chat.id), `🆔 Your ID: \`${msg.chat.id}\``);
 });
 
-bot.onText(/\/testlink/, async (msg) => {
+bot.onText(/\/grant (\d+)(?: (.+))?/, async (msg, match) => {
   if (!ADMIN_IDS.includes(cid(msg.chat.id))) return;
-  try {
-    const res = await bot.createChatInviteLink(CHANNEL_ID, {
-      member_limit: 1,
-      expire_date: Math.floor(Date.now() / 1000) + 300,
-    });
-    safeSendMessage(cid(msg.chat.id), `✅ Test link: ${res.invite_link}`);
-  } catch (err) {
-    safeSendMessage(cid(msg.chat.id), `❌ Error: ${err.message}\n\nMake sure bot is admin in the channel!`);
-  }
+  await grantAccess(match[1], match[2] || "1 Month", "✅ Admin granted");
+  safeSendMessage(cid(msg.chat.id), `✅ Granted to ${match[1]}`);
 });
 
-// ─── ADMIN APPROVAL COMMANDS ─────────────────────────────────────────────────
-bot.onText(/\/approve (\d+)/, async (msg, match) => {
+bot.onText(/\/remove (\d+)/, async (msg, match) => {
   if (!ADMIN_IDS.includes(cid(msg.chat.id))) return;
-  
-  const targetId = cid(match[1]);
-  const pending = pendingManualApprovals[targetId];
-  
-  if (!pending) {
-    return safeSendMessage(cid(msg.chat.id), `❌ No pending approval found for user ${targetId}`);
-  }
-  
-  try {
-    await grantAccess(targetId, pending.plan, `✅ Manual payment approved by admin\n💰 Amount: Ksh ${pending.price}\n🧾 Code: \`${pending.code}\``, true);
-    await safeSendMessage(cid(msg.chat.id), `✅ Access granted to ${targetId} for ${pending.plan}`);
-    
-    // Notify user
-    await safeSendMessage(targetId,
-      `✅ *Payment Approved!*\n\n` +
-      `Your payment of Ksh *${pending.price}* has been verified.\n\n` +
-      `Your access link has been sent above. Enjoy! 🎉`
-    );
-  } catch (err) {
-    await safeSendMessage(cid(msg.chat.id), `❌ Failed to grant access: ${err.message}`);
-  }
+  await removeUserFromChannel(match[1], "admin command");
+  clearSubTimers(match[1]);
+  safeSendMessage(cid(msg.chat.id), `✅ Removed ${match[1]}`);
 });
 
-bot.onText(/\/deny (\d+)/, async (msg, match) => {
+bot.onText(/\/listsubs/, async (msg) => {
   if (!ADMIN_IDS.includes(cid(msg.chat.id))) return;
-  
-  const targetId = cid(match[1]);
-  const pending = pendingManualApprovals[targetId];
-  
-  if (!pending) {
-    return safeSendMessage(cid(msg.chat.id), `❌ No pending approval found for user ${targetId}`);
+  const subs = loadSubs();
+  let msgText = "*Active Subscriptions:*\n";
+  for (const [id, sub] of Object.entries(subs)) {
+    if (sub.expiresAt > Date.now()) {
+      msgText += `• \`${id}\` - ${sub.planLabel} - expires ${new Date(sub.expiresAt).toLocaleString()}\n`;
+    }
   }
-  
-  delete pendingManualApprovals[targetId];
-  
-  // Notify user
-  await safeSendMessage(targetId,
-    `❌ *Payment Denied*\n\n` +
-    `We could not verify your payment with code \`${pending.code}\`.\n\n` +
-    `Please check your transaction and try again, or use STK Push for instant access.`
-  );
-  
-  await safeSendMessage(cid(msg.chat.id), `✅ Payment denied for ${targetId}`);
+  safeSendMessage(cid(msg.chat.id), msgText || "No active subscriptions");
 });
 
-// ─── Package handlers ─────────────────────────────────────────────────────────
+// ─── CALLBACK QUERY HANDLER ──────────────────────────────────────────────────
 bot.on("callback_query", async (query) => {
   const chatId = cid(query.message.chat.id);
   const data = query.data;
-  
   bot.answerCallbackQuery(query.id).catch(() => {});
   
   if (data === "package_test") {
-    userSelections[chatId] = { 
-      ...userSelections[chatId],
-      package: "Test Package", 
-      plan: "20 Min Test", 
-      price: 1 
-    };
+    userSelections[chatId] = { ...userSelections[chatId], package: "Test", plan: "20 Min Test", price: 1 };
     saveUserSelection(chatId, userSelections[chatId]);
-    return safeSendMessage(chatId,
-      `🧪 *Test Mode - 20 Minute Access*\n💰 Cost: Ksh 1\n\nHow would you like to pay?`,
-      {
-        reply_markup: {
-          inline_keyboard: [
-            [{ text: "📲 Pay via STK Push", callback_data: "pay_stk" }],
-            [{ text: "💳 Enter Transaction Code", callback_data: "manual_code" }],
-            [{ text: "🏧 Manual via Till", callback_data: "show_till" }]
-          ]
-        }
-      }
-    );
+    return safeSendMessage(chatId, `🧪 Test - Ksh 1\n\nPay via STK Push:`, {
+      reply_markup: { inline_keyboard: [[{ text: "📲 Pay via STK Push", callback_data: "pay_stk" }]] }
+    });
   }
   
   if (data === "package_premium") {
-    userSelections[chatId] = { 
-      ...userSelections[chatId],
-      package: "Premium (Naughty Premium Leaks)" 
-    };
+    userSelections[chatId] = { ...userSelections[chatId], package: "Premium" };
     saveUserSelection(chatId, userSelections[chatId]);
-    return safeSendMessage(chatId, `🔥 *Premium Package*\n\nSelect plan:`, {
+    return safeSendMessage(chatId, `🔥 *Premium Package*\nSelect plan:`, {
       reply_markup: {
         inline_keyboard: [
-          [{ text: "1 Hour — Ksh 20", callback_data: "premium_1hour" }],
-          [{ text: "6 Hours — Ksh 30", callback_data: "premium_6hours" }],
-          [{ text: "1 Day — Ksh 70", callback_data: "premium_1day" }],
-          [{ text: "1 Week — Ksh 220", callback_data: "premium_1week" }],
-          [{ text: "2 Weeks — Ksh 400", callback_data: "premium_2weeks" }],
-          [{ text: "1 Month — Ksh 680", callback_data: "premium_1month" }],
-          [{ text: "6 Months — Ksh 3500", callback_data: "premium_6months" }],
-          [{ text: "1 Year — Ksh 7000", callback_data: "premium_1year" }],
-          [{ text: "🧪 TEST: 20 Min (1 KSH)", callback_data: "premium_test" }]
+          [{ text: "1 Hour - Ksh 20", callback_data: "premium_1hour" }],
+          [{ text: "6 Hours - Ksh 30", callback_data: "premium_6hours" }],
+          [{ text: "1 Day - Ksh 70", callback_data: "premium_1day" }],
+          [{ text: "1 Week - Ksh 220", callback_data: "premium_1week" }],
+          [{ text: "1 Month - Ksh 680", callback_data: "premium_1month" }],
+          [{ text: "6 Months - Ksh 3500", callback_data: "premium_6months" }],
+          [{ text: "1 Year - Ksh 7000", callback_data: "premium_1year" }]
         ]
       }
     });
   }
   
   if (data === "package_explicit") {
-    userSelections[chatId] = { 
-      ...userSelections[chatId],
-      package: "Explicit (Naughty Explicit)" 
-    };
+    userSelections[chatId] = { ...userSelections[chatId], package: "Explicit" };
     saveUserSelection(chatId, userSelections[chatId]);
-    return safeSendMessage(chatId, `💥 *Explicit Package*\n\nSelect plan:`, {
+    return safeSendMessage(chatId, `💥 *Explicit Package*\nSelect plan:`, {
       reply_markup: {
         inline_keyboard: [
-          [{ text: "1 Hour — Ksh 30", callback_data: "explicit_1hour" }],
-          [{ text: "6 Hours — Ksh 50", callback_data: "explicit_6hours" }],
-          [{ text: "1 Day — Ksh 100", callback_data: "explicit_1day" }],
-          [{ text: "1 Week — Ksh 170", callback_data: "explicit_1week" }],
-          [{ text: "2 Weeks — Ksh 270", callback_data: "explicit_2weeks" }],
-          [{ text: "1 Month — Ksh 450", callback_data: "explicit_1month" }],
-          [{ text: "6 Months — Ksh 2500", callback_data: "explicit_6months" }],
-          [{ text: "1 Year — Ksh 6200", callback_data: "explicit_1year" }],
-          [{ text: "🧪 TEST: 20 Min (1 KSH)", callback_data: "explicit_test" }]
+          [{ text: "1 Hour - Ksh 30", callback_data: "explicit_1hour" }],
+          [{ text: "6 Hours - Ksh 50", callback_data: "explicit_6hours" }],
+          [{ text: "1 Day - Ksh 100", callback_data: "explicit_1day" }],
+          [{ text: "1 Week - Ksh 170", callback_data: "explicit_1week" }],
+          [{ text: "1 Month - Ksh 450", callback_data: "explicit_1month" }],
+          [{ text: "6 Months - Ksh 2500", callback_data: "explicit_6months" }],
+          [{ text: "1 Year - Ksh 6200", callback_data: "explicit_1year" }]
         ]
       }
     });
   }
   
-  // Premium plan selection
-  if (data.startsWith("premium_") && PLANS[data]) {
+  if (PLANS[data]) {
     const plan = PLANS[data];
-    const sel = userSelections[chatId] || {};
-    sel.plan = plan.label;
-    sel.price = plan.price;
-    userSelections[chatId] = sel;
-    saveUserSelection(chatId, sel);
-    
-    return safeSendMessage(chatId,
-      `✅ *${sel.package || "Premium"}* — *${plan.label}*\n💰 Ksh *${plan.price}*\n\nHow would you like to pay?`,
-      {
-        reply_markup: {
-          inline_keyboard: [
-            [{ text: "📲 Pay via STK Push", callback_data: "pay_stk" }],
-            [{ text: "💳 Enter Transaction Code", callback_data: "manual_code" }],
-            [{ text: "🏧 Manual via Till", callback_data: "show_till" }]
-          ]
-        }
-      }
-    );
-  }
-  
-  // Explicit plan selection
-  if (data.startsWith("explicit_") && PLANS[data]) {
-    const plan = PLANS[data];
-    const sel = userSelections[chatId] || {};
-    sel.plan = plan.label;
-    sel.price = plan.price;
-    userSelections[chatId] = sel;
-    saveUserSelection(chatId, sel);
-    
-    return safeSendMessage(chatId,
-      `✅ *${sel.package || "Explicit"}* — *${plan.label}*\n💰 Ksh *${plan.price}*\n\nHow would you like to pay?`,
-      {
-        reply_markup: {
-          inline_keyboard: [
-            [{ text: "📲 Pay via STK Push", callback_data: "pay_stk" }],
-            [{ text: "💳 Enter Transaction Code", callback_data: "manual_code" }],
-            [{ text: "🏧 Manual via Till", callback_data: "show_till" }]
-          ]
-        }
-      }
-    );
+    userSelections[chatId].plan = plan.label;
+    userSelections[chatId].price = plan.price;
+    saveUserSelection(chatId, userSelections[chatId]);
+    return safeSendMessage(chatId, `✅ ${plan.label} - Ksh ${plan.price}\n\nPay via STK Push:`, {
+      reply_markup: { inline_keyboard: [[{ text: "📲 Pay via STK Push", callback_data: "pay_stk" }]] }
+    });
   }
   
   if (data === "pay_stk") {
     const sel = userSelections[chatId];
-    if (!sel || !sel.price) {
-      return safeSendMessage(chatId, `⚠️ Please select a package first using /start`);
-    }
+    if (!sel?.price) return safeSendMessage(chatId, `⚠️ Select a package first using /start`);
     userSelections[chatId].awaitingPhone = true;
     saveUserSelection(chatId, userSelections[chatId]);
-    return safeSendMessage(chatId, `📱 *Enter your M-Pesa phone number* (e.g., 0712345678):`);
-  }
-  
-  if (data === "manual_code") {
-    const sel = userSelections[chatId];
-    if (!sel || !sel.price) {
-      return safeSendMessage(chatId, `⚠️ Please select a package first using /start`);
-    }
-    userSelections[chatId].awaitingManualCode = true;
-    saveUserSelection(chatId, userSelections[chatId]);
-    return safeSendMessage(chatId,
-      `📝 *Enter your M-Pesa Transaction Code*\n\n` +
-      `Please send the 10-character code from your M-Pesa message (e.g., \`RCX4B2K9QP\`)\n\n` +
-      `*Note:* This will be reviewed by an admin and you'll receive access within a few minutes.`
-    );
-  }
-  
-  if (data === "show_till") {
-    const sel = userSelections[chatId];
-    if (!sel || !sel.price) {
-      return safeSendMessage(chatId, `⚠️ Please select a package first using /start`);
-    }
-    return safeSendMessage(chatId,
-      `🏧 *M-Pesa Till Number:* \`${TILL_NUMBER}\`\n📛 *Business:* ${TILL_NAME}\n💰 *Amount:* Ksh ${sel.price}\n\n` +
-      `After payment, tap the "Enter Transaction Code" button below to submit your code for verification.`,
-      {
-        reply_markup: {
-          inline_keyboard: [
-            [{ text: "💳 Enter Transaction Code", callback_data: "manual_code" }],
-            [{ text: "🔄 Back to Payment Options", callback_data: `back_to_payment_${sel.plan}` }]
-          ]
-        }
-      }
-    );
+    return safeSendMessage(chatId, `📱 *Enter M-Pesa phone number* (e.g., 0712345678):`);
   }
   
   if (data === "change_package") {
-    // Reset user selection but keep username
     const username = userSelections[chatId]?.username;
-    userSelections[chatId] = { username: username };
+    userSelections[chatId] = { username };
     saveUserSelection(chatId, userSelections[chatId]);
-    
-    return safeSendMessage(chatId, `🔄 Choose your package:`, {
+    return safeSendMessage(chatId, `🔄 Choose package:`, {
       reply_markup: {
         inline_keyboard: [
-          [{ text: "🔥 Premium (Naughty Premium Leaks)", callback_data: "package_premium" }],
-          [{ text: "💥 Explicit (Naughty Explicit)", callback_data: "package_explicit" }],
-          [{ text: "🧪 TEST: 20 Min Access (1 KSH)", callback_data: "package_test" }]
+          [{ text: "🔥 Premium", callback_data: "package_premium" }],
+          [{ text: "💥 Explicit", callback_data: "package_explicit" }],
+          [{ text: "🧪 TEST: 20 Min (1 KSH)", callback_data: "package_test" }]
         ]
       }
     });
   }
   
-  if (data.startsWith("back_to_payment_")) {
-    const planLabel = data.replace("back_to_payment_", "");
-    const sel = userSelections[chatId];
-    if (sel && sel.plan) {
-      return safeSendMessage(chatId,
-        `✅ *${sel.package || "Package"}* — *${sel.plan}*\n💰 Ksh *${sel.price}*\n\nHow would you like to pay?`,
-        {
-          reply_markup: {
-            inline_keyboard: [
-              [{ text: "📲 Pay via STK Push", callback_data: "pay_stk" }],
-              [{ text: "💳 Enter Transaction Code", callback_data: "manual_code" }],
-              [{ text: "🏧 Manual via Till", callback_data: "show_till" }]
-            ]
-          }
-        }
-      );
-    }
-    return safeSendMessage(chatId, `Please select a package using /start`);
+  if (data === "show_manual_code_entry") {
+    userSelections[chatId].awaitingManualCode = true;
+    saveUserSelection(chatId, userSelections[chatId]);
+    return safeSendMessage(chatId,
+      `📝 *Enter your 10-digit M-Pesa transaction code*\n\nExample: \`RCX4B2K9QP\`\n\nAdmin will approve within minutes.`
+    );
+  }
+  
+  if (data === "retry_stk") {
+    userSelections[chatId].awaitingPhone = true;
+    saveUserSelection(chatId, userSelections[chatId]);
+    return safeSendMessage(chatId, `📱 *Enter phone number to retry:*`);
   }
 });
 
-// ─── Handle text messages (Phone numbers & Manual codes) ──────────────────────
+// ─── MESSAGE HANDLER ─────────────────────────────────────────────────────────
 bot.on("message", async (msg) => {
   if (!msg.text || msg.text.startsWith("/")) return;
   
@@ -935,273 +719,118 @@ bot.on("message", async (msg) => {
   const text = msg.text.trim();
   const sel = userSelections[chatId];
   
-  // Handle phone number input for STK Push
-  if (sel && sel.awaitingPhone) {
+  // Handle phone number for STK
+  if (sel?.awaitingPhone) {
     sel.awaitingPhone = false;
     saveUserSelection(chatId, sel);
     
     try {
       const cleaned = validatePhone(text);
-      await safeSendMessage(chatId, `⏳ Sending STK push to ${text}...`);
+      await safeSendMessage(chatId, `⏳ Sending STK push...`);
       const result = await stkPush(text, sel.price, chatId);
       
       if (result.ResponseCode === "0") {
         await safeSendMessage(chatId,
-          `✅ *Payment prompt sent!*\n\nEnter your M-Pesa PIN to complete.\n\n` +
-          `Once payment is confirmed, you'll automatically receive access.`
+          `✅ *STK Push Sent!*\n\nEnter PIN when prompted.\n\nIf you don't receive it, tap below:`,
+          {
+            reply_markup: {
+              inline_keyboard: [
+                [{ text: "📝 Enter Code Manually", callback_data: "show_manual_code_entry" }],
+                [{ text: "🔄 Retry STK", callback_data: "retry_stk" }]
+              ]
+            }
+          }
         );
-      } else {
-        await safeSendMessage(chatId, `⚠️ Could not send prompt. Try manual payment instead.`);
       }
     } catch (err) {
-      await safeSendMessage(chatId, `❌ Invalid number. Please use /start to try again.`);
+      await safeSendMessage(chatId, `❌ Invalid number. Try /start again.`);
     }
     return;
   }
   
-  // Handle manual transaction code submission (requires admin approval)
-  if (sel && sel.awaitingManualCode && /^[A-Z0-9]{10}$/i.test(text)) {
+  // Handle manual transaction code (admin approval)
+  if (sel?.awaitingManualCode && /^[A-Z0-9]{10}$/i.test(text)) {
     sel.awaitingManualCode = false;
     const code = text.toUpperCase();
+    saveUserSelection(chatId, sel);
     
-    // Check if user has an active subscription
-    const subData = loadSubs()[chatId];
-    if (subData && subData.expiresAt > Date.now()) {
-      return safeSendMessage(chatId, `✅ You already have an active subscription! Enjoy the content 😊`);
-    }
-    
-    if (!sel || !sel.price) {
-      return safeSendMessage(chatId, `⚠️ Please select a package first using /start`);
-    }
-    
-    // Store pending approval
     pendingManualApprovals[chatId] = {
-      plan: sel.plan,
-      price: sel.price,
-      code: code,
-      package: sel.package,
-      username: sel.username,
-      timestamp: Date.now()
+      plan: sel.plan, price: sel.price, code, package: sel.package, username: sel.username, timestamp: Date.now()
     };
     
-    // Notify user
     await safeSendMessage(chatId,
-      `⏳ *Transaction Code Received*\n\n` +
-      `Code: \`${code}\`\n` +
-      `Amount: Ksh ${sel.price}\n` +
-      `Plan: ${sel.plan}\n\n` +
-      `Your payment is pending admin verification. You'll receive access once approved.\n\n` +
-      `*This usually takes 2-5 minutes.*`
+      `⏳ *Code Received!*\n\nCode: \`${code}\`\nAmount: Ksh ${sel.price}\n\nWaiting for admin approval (2-5 min).`
     );
     
-    // Notify admins
     notifyAdmins(
-      `🕐 *MANUAL PAYMENT AWAITING APPROVAL*\n\n` +
-      `👤 User: \`${chatId}\` (${sel.username || "Unknown"})\n` +
-      `📦 Package: ${sel.package || "N/A"}\n` +
-      `📅 Plan: ${sel.plan}\n` +
-      `💰 Amount: Ksh ${sel.price}\n` +
-      `🧾 Code: \`${code}\`\n\n` +
-      `Use:\n` +
-      `/approve ${chatId} - to grant access\n` +
-      `/deny ${chatId} - to deny access`,
-      { reply_markup: {
-        inline_keyboard: [
-          [{ text: "✅ Approve", callback_data: `admin_approve_${chatId}` }, 
-           { text: "❌ Deny", callback_data: `admin_deny_${chatId}` }]
-        ]
-      }}
+      `🕐 *MANUAL PAYMENT*\nUser: \`${chatId}\`\nPlan: ${sel.plan}\nAmount: Ksh ${sel.price}\nCode: \`${code}\`\n\n/approve ${chatId} or /deny ${chatId}`
     );
-    
-    saveUserSelection(chatId, sel);
     return;
   }
   
-  // If user sends a code but not in manual mode, prompt them to use the button
-  if (/^[A-Z0-9]{10}$/i.test(text) && (!sel || !sel.awaitingManualCode)) {
-    return safeSendMessage(chatId,
-      `📝 Please select a package first using /start, then tap the "Enter Transaction Code" button to submit your payment code.`
-    );
-  }
-  
-  // Check if user has an active subscription before asking for payment
+  // Check active subscription
   const subData = loadSubs()[chatId];
   if (subData && subData.expiresAt > Date.now()) {
-    // User has active subscription, don't ask for payment
-    const remainingHours = Math.ceil((subData.expiresAt - Date.now()) / (1000 * 60 * 60));
-    const remainingDays = Math.ceil((subData.expiresAt - Date.now()) / (1000 * 60 * 60 * 24));
-    let timeText = remainingDays > 0 ? `${remainingDays} day(s)` : `${remainingHours} hour(s)`;
-    
+    const remaining = Math.ceil((subData.expiresAt - Date.now()) / (1000 * 60 * 60));
     await safeSendMessage(chatId,
-      `✨ *You're already subscribed!* ✨\n\n` +
-      `Your *${subData.planLabel}* plan is active with *${timeText}* remaining.\n\n` +
-      `Enjoy the sweet content! 😊\n\n` +
-      `Want to extend or upgrade? Tap below 👇`,
-      {
-        reply_markup: { inline_keyboard: [[{ text: "🔄 Extend / Upgrade", callback_data: "change_package" }]] }
-      }
+      `✨ *Active Subscription!*\n\n${subData.planLabel} - ${remaining} hours remaining.\n\nTap to extend:`,
+      { reply_markup: { inline_keyboard: [[{ text: "🔄 Extend", callback_data: "change_package" }]] } }
     );
     return;
   }
   
-  // Default response for users without selection
-  if (!sel || !sel.price) {
-    await safeSendMessage(chatId,
-      `🎬 *Ready for some sweet content?*\n\n` +
-      `Tap /start to select a package and payment method.`
-    );
-  } else if (!sel.paidAt && !sel.awaitingManualCode) {
-    await safeSendMessage(chatId,
-      `💫 *Almost there!*\n\n` +
-      `Tap one of the payment options below to complete your purchase.`,
-      {
-        reply_markup: {
-          inline_keyboard: [
-            [{ text: "📲 Pay via STK Push", callback_data: "pay_stk" }],
-            [{ text: "💳 Enter Transaction Code", callback_data: "manual_code" }],
-            [{ text: "🏧 Manual via Till", callback_data: "show_till" }]
-          ]
-        }
-      }
-    );
-  }
+  await safeSendMessage(chatId, `🎬 Tap /start to subscribe!`);
 });
 
-// ─── Admin callback handlers for quick approval ──────────────────────────────
-bot.on("callback_query", async (query) => {
-  const data = query.data;
-  const adminId = cid(query.from.id);
-  
-  if (data && data.startsWith("admin_approve_")) {
-    if (!ADMIN_IDS.includes(adminId)) {
-      return bot.answerCallbackQuery(query.id, { text: "Only admins can approve payments" });
-    }
-    
-    const targetId = data.replace("admin_approve_", "");
-    const pending = pendingManualApprovals[targetId];
-    
-    if (!pending) {
-      await bot.answerCallbackQuery(query.id, { text: "No pending approval found" });
-      return;
-    }
-    
-    await bot.answerCallbackQuery(query.id, { text: "Processing approval..." });
-    
-    try {
-      await grantAccess(targetId, pending.plan, `✅ Manual payment approved by admin\n💰 Amount: Ksh ${pending.price}\n🧾 Code: \`${pending.code}\``, true);
-      await safeSendMessage(adminId, `✅ Access granted to ${targetId} for ${pending.plan}`);
-      await safeSendMessage(targetId,
-        `✅ *Payment Approved!*\n\n` +
-        `Your payment of Ksh *${pending.price}* has been verified.\n\n` +
-        `Your access link has been sent above. Enjoy! 🎉`
-      );
-    } catch (err) {
-      await safeSendMessage(adminId, `❌ Failed to grant access: ${err.message}`);
-    }
-    return;
-  }
-  
-  if (data && data.startsWith("admin_deny_")) {
-    if (!ADMIN_IDS.includes(adminId)) {
-      return bot.answerCallbackQuery(query.id, { text: "Only admins can deny payments" });
-    }
-    
-    const targetId = data.replace("admin_deny_", "");
-    const pending = pendingManualApprovals[targetId];
-    
-    if (!pending) {
-      await bot.answerCallbackQuery(query.id, { text: "No pending approval found" });
-      return;
-    }
-    
-    delete pendingManualApprovals[targetId];
-    await bot.answerCallbackQuery(query.id, { text: "Payment denied" });
-    
-    await safeSendMessage(targetId,
-      `❌ *Payment Denied*\n\n` +
-      `We could not verify your payment with code \`${pending.code}\`.\n\n` +
-      `Please check your transaction and try again, or use STK Push for instant access.`
-    );
-    
-    await safeSendMessage(adminId, `✅ Payment denied for ${targetId}`);
-    return;
-  }
-});
-
-// ─── GRANT COMMAND FOR ADMINS ─────────────────────────────────────────────────
-bot.onText(/\/grant (\d+)(?: (.+))?/, async (msg, match) => {
+// ─── ADMIN APPROVAL ──────────────────────────────────────────────────────────
+bot.onText(/\/approve (\d+)/, async (msg, match) => {
   if (!ADMIN_IDS.includes(cid(msg.chat.id))) return;
-  const targetId = cid(match[1]);
-  const plan = match[2] || "1 Month";
+  const targetId = match[1];
+  const pending = pendingManualApprovals[targetId];
+  if (!pending) return safeSendMessage(cid(msg.chat.id), `No pending for ${targetId}`);
   
-  try {
-    await grantAccess(targetId, plan, `✅ Manually granted by admin`);
-    safeSendMessage(cid(msg.chat.id), `✅ Access granted to ${targetId} for ${plan}`);
-  } catch (err) {
-    safeSendMessage(cid(msg.chat.id), `❌ Failed: ${err.message}`);
-  }
+  await grantAccess(targetId, pending.plan, `✅ Admin approved: Ksh ${pending.price}\nCode: ${pending.code}`, true);
+  safeSendMessage(cid(msg.chat.id), `✅ Granted to ${targetId}`);
 });
 
-// ─── STATUS ENDPOINT ──────────────────────────────────────────────────────────
+bot.onText(/\/deny (\d+)/, async (msg, match) => {
+  if (!ADMIN_IDS.includes(cid(msg.chat.id))) return;
+  const targetId = match[1];
+  const pending = pendingManualApprovals[targetId];
+  if (pending) {
+    delete pendingManualApprovals[targetId];
+    await safeSendMessage(targetId, `❌ Payment code \`${pending.code}\` could not be verified. Please try again.`);
+  }
+  safeSendMessage(cid(msg.chat.id), `✅ Denied ${targetId}`);
+});
+
+// ─── STATUS & SERVER ─────────────────────────────────────────────────────────
 app.get("/api/status", (req, res) => {
-  const subs = loadSubs();
   res.json({
     status: "online",
-    autoApprove: true,
-    pendingSTKCount: Object.keys(pendingSTK).length,
-    pendingManualCount: Object.keys(pendingManualApprovals).length,
     activeSubscriptions: Object.keys(subTimers).length,
-    persistedSubscriptions: Object.keys(subs).length,
-    activeSessions: Object.keys(userSelections).length,
+    persistedSubscriptions: Object.keys(loadSubs()).length,
     timestamp: new Date().toISOString()
   });
 });
 
-// ─── AUTO-VERIFY PENDING TRANSACTIONS ─────────────────────────────────────────
-async function autoVerifyPendingTransactions() {
-  for (const [checkoutId, pending] of Object.entries(pendingSTK)) {
-    if (Date.now() - (pending.expiresAt || 0) < 10 * 60 * 1000) {
-      try {
-        const token = await getMpesaToken();
-        const timestamp = moment().format("YYYYMMDDHHmmss");
-        const password = Buffer.from(`${SHORTCODE}${PASSKEY}${timestamp}`).toString("base64");
-        
-        const response = await axios.post(
-          "https://api.safaricom.co.ke/mpesa/stkpushquery/v1/query",
-          { BusinessShortCode: SHORTCODE, Password: password, Timestamp: timestamp, CheckoutRequestID: checkoutId },
-          { headers: { Authorization: `Bearer ${token}` } }
-        );
-        
-        if (response.data.ResultCode === "0") {
-          const id = cid(pending.chatId);
-          const sel = userSelections[id] || {};
-          sel.paidAt = new Date().toISOString();
-          sel.stkRef = response.data.MpesaReceiptNumber;
-          userSelections[id] = sel;
-          saveUserSelection(id, sel);
-          
-          await grantAccess(id, pending.plan || "1 Month", `✅ Auto-verified: Ksh ${response.data.Amount}`);
-          delete pendingSTK[checkoutId];
-          savePendingSTK(pendingSTK);
-        }
-      } catch (err) {
-        console.error("Auto-verify error:", err.message);
-      }
+// ─── MONITOR TIMERS (DEBUG) ──────────────────────────────────────────────────
+setInterval(() => {
+  for (const [chatId, timer] of Object.entries(subTimers)) {
+    const remaining = timer.expiresAt - Date.now();
+    if (remaining > 0 && remaining < 60000) {
+      console.log(`⚠️ Timer for ${chatId} expires in ${Math.floor(remaining/1000)} seconds!`);
     }
   }
-}
+}, 10000);
 
-setInterval(autoVerifyPendingTransactions, 30000);
-
-// ─── RESTORE SUBSCRIPTIONS ON STARTUP ─────────────────────────────────────────
+// ─── STARTUP ─────────────────────────────────────────────────────────────────
 restoreActiveSubscriptions();
 
-// ─── EXPRESS SERVER ──────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`🚀 Server on port ${PORT}`);
   console.log(`📺 Channel ID: ${CHANNEL_ID}`);
-  console.log(`🤖 Bot is running with auto-approval for STK Push`);
-  console.log(`👨‍💼 Manual transaction codes require admin approval`);
-  console.log(`🧪 Test with "20 Min Test" plan for Ksh 1`);
+  console.log(`🔐 AUTO-REMOVAL ON EXPIRY: ACTIVE`);
+  console.log(`⏰ Expiry timers will automatically remove users from channel`);
 });
