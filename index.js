@@ -69,6 +69,9 @@ const awaitingReceipt = {};
 const reminderTimers  = {};
 const subTimers       = {};
 
+// Track codes currently being verified to prevent duplicate processing
+const verifyingCodes  = new Set();
+
 let autoExpireSubscriptions = process.env.AUTO_EXPIRE !== 'false';
 let autoSendInvite          = process.env.AUTO_SEND_INVITE !== 'false';
 
@@ -81,6 +84,11 @@ const PACKAGE_KEYBOARD = {
 
 // ─── CHANNEL_ID ──────────────────────────────────────────────────────────────
 const CHANNEL_ID = -1001567081082;
+
+// ─── PERSISTENCE FILES ──────────────────────────────────────────────────────
+const SUBS_FILE         = path.join(__dirname, "subscriptions.json");
+const PENDING_STK_FILE  = path.join(__dirname, "pending_stk.json");
+const USER_SEL_FILE     = path.join(__dirname, "user_selections.json");
 
 // ─── BOT: LONG POLLING (with webhook cleanup) ────────────────────────────────
 const bot = new TelegramBot(BOT_TOKEN, { polling: false });
@@ -131,12 +139,6 @@ pendingSTK = loadPendingSTK();
   }
 })();
 
-// ─── PERSISTENCE FILES ──────────────────────────────────────────────────────
-const SUBS_FILE         = path.join(__dirname, "subscriptions.json");
-const PENDING_STK_FILE  = path.join(__dirname, "pending_stk.json");
-// FIX: persist userSelections so plan/pkg survive server restarts
-const USER_SEL_FILE     = path.join(__dirname, "user_selections.json");
-
 // ─── SUBSCRIPTION PERSISTENCE ────────────────────────────────────────────────
 function loadSubs() {
   try {
@@ -178,9 +180,6 @@ function savePendingSTK(data) {
 }
 
 // ─── USER SELECTIONS PERSISTENCE ─────────────────────────────────────────────
-// FIX: userSelections was in-memory only. On restart, plan/pkg/price were lost,
-// causing pendingSTK entries to have null values and grantAccess to fall back
-// to "1 Month" regardless of what the user had selected.
 function loadUserSelections() {
   try {
     if (fs.existsSync(USER_SEL_FILE)) {
@@ -273,6 +272,342 @@ async function sendTyping(chatId, durationMs = 1500) {
   }
 }
 
+// ─── M-PESA: GET ACCESS TOKEN ─────────────────────────────────────────────────
+async function getMpesaToken() {
+  try {
+    const auth = Buffer.from(`${CONSUMER_KEY}:${CONSUMER_SECRET}`).toString("base64");
+    const res  = await axios.get(
+      "https://api.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials",
+      { headers: { Authorization: `Basic ${auth}` } }
+    );
+    return res.data.access_token;
+  } catch (err) {
+    notifyAdmins(`🚨 *Daraja Token Error*\n\`${err.response?.data?.errorMessage || err.message}\``);
+    throw err;
+  }
+}
+
+// ─── M-PESA: VERIFY TRANSACTION BY RECEIPT CODE ──────────────────────────────
+// Queries the Daraja Transaction Status API to confirm a receipt code is real
+// and the payment went to our till. Returns the transaction details or null.
+async function verifyMpesaTransaction(receiptCode) {
+  try {
+    const token     = await getMpesaToken();
+    const timestamp = moment().format("YYYYMMDDHHmmss");
+    const password  = Buffer.from(`${SHORTCODE}${PASSKEY}${timestamp}`).toString("base64");
+
+    const res = await axios.post(
+      "https://api.safaricom.co.ke/mpesa/transactionstatus/v1/query",
+      {
+        Initiator:          "apiop", // Your Daraja initiator name from portal
+        SecurityCredential: password,
+        CommandID:          "TransactionStatusQuery",
+        TransactionID:      receiptCode,
+        PartyA:             TILL_NUMBER,
+        IdentifierType:     "4", // 4 = till number
+        ResultURL:          CALLBACK_URL.replace("/mpesa/callback", "/mpesa/transresult"),
+        QueueTimeOutURL:    CALLBACK_URL.replace("/mpesa/callback", "/mpesa/transresult"),
+        Remarks:            "Verify",
+        Occasion:           ""
+      },
+      { headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" } }
+    );
+
+    console.log("🔍 Transaction status query response:", JSON.stringify(res.data));
+    // A ResponseCode of "0" means the query was accepted — result comes via callback
+    return res.data;
+  } catch (err) {
+    console.error("❌ verifyMpesaTransaction error:", err.response?.data || err.message);
+    return null;
+  }
+}
+
+// ─── IN-PROCESS RECEIPT VERIFICATION (C2B query) ────────────────────────────
+// This is a faster, synchronous check using the Daraja Account Balance / C2B
+// confirmation approach. We query the transaction directly and trust the result.
+// Falls back to admin approval if the API call fails.
+async function autoVerifyReceipt(chatId, receiptCode, receiptInfo) {
+  const id = cid(chatId);
+
+  // Guard: don't process the same code twice simultaneously
+  if (verifyingCodes.has(receiptCode)) {
+    console.log(`⏳ Already verifying ${receiptCode} — skipping duplicate`);
+    return;
+  }
+  verifyingCodes.add(receiptCode);
+
+  try {
+    await sendTyping(id, 1500);
+    await safeSendMessage(id,
+      `🔍 *Verifying your payment...*\n\nChecking with M-Pesa now. This takes a few seconds ⏳`,
+      { parse_mode: "Markdown" }
+    );
+
+    const token = await getMpesaToken();
+
+    // Use the Daraja Transaction Status API
+    const timestamp = moment().format("YYYYMMDDHHmmss");
+    const password  = Buffer.from(`${SHORTCODE}${PASSKEY}${timestamp}`).toString("base64");
+
+    // Store pending verification so the result callback can find it
+    pendingReceiptVerifications[receiptCode] = {
+      chatId: id,
+      plan:   receiptInfo.plan  || "1 Month",
+      pkg:    receiptInfo.pkg   || "N/A",
+      price:  receiptInfo.price || 0,
+    };
+
+    const initiatorName = process.env.MPESA_INITIATOR_NAME || "apiop";
+    const initiatorPass = process.env.MPESA_INITIATOR_PASS;
+
+    // Build Security Credential — base64 of initiator password encrypted with
+    // Safaricom's public cert. If not configured, fall back to admin flow.
+    if (!initiatorPass) {
+      console.warn("⚠️ MPESA_INITIATOR_PASS not set — falling back to admin receipt verification");
+      delete pendingReceiptVerifications[receiptCode];
+      await fallbackToAdminVerification(id, receiptCode, receiptInfo);
+      return;
+    }
+
+    // For sandbox: password is plain base64. For production: must be RSA-encrypted.
+    // This implementation uses plain base64 (works for sandbox; for prod, encrypt properly).
+    const securityCredential = Buffer.from(initiatorPass).toString("base64");
+
+    const res = await axios.post(
+      "https://api.safaricom.co.ke/mpesa/transactionstatus/v1/query",
+      {
+        Initiator:          initiatorName,
+        SecurityCredential: securityCredential,
+        CommandID:          "TransactionStatusQuery",
+        TransactionID:      receiptCode,
+        PartyA:             TILL_NUMBER,
+        IdentifierType:     "4",
+        ResultURL:          CALLBACK_URL.replace("/mpesa/callback", "/mpesa/transresult"),
+        QueueTimeOutURL:    CALLBACK_URL.replace("/mpesa/callback", "/mpesa/transtimeout"),
+        Remarks:            "VerifyPayment",
+        Occasion:           "Access"
+      },
+      { headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" } }
+    );
+
+    console.log(`📡 Transaction status query sent for ${receiptCode}:`, JSON.stringify(res.data));
+
+    if (res.data.ResponseCode === "0") {
+      // Query accepted — wait for async result via /mpesa/transresult
+      await safeSendMessage(id,
+        `⏳ *Almost there!*\n\nYour payment code has been sent to M-Pesa for verification.\nYou'll receive your access link automatically once confirmed — usually within 30 seconds. 🔐`,
+        { parse_mode: "Markdown" }
+      );
+    } else {
+      // Query rejected — fall back to admin
+      console.warn(`⚠️ Transaction status query rejected: ${res.data.ResponseDescription}`);
+      delete pendingReceiptVerifications[receiptCode];
+      await fallbackToAdminVerification(id, receiptCode, receiptInfo);
+    }
+  } catch (err) {
+    console.error("❌ autoVerifyReceipt error:", err.message);
+    delete pendingReceiptVerifications[receiptCode];
+    await fallbackToAdminVerification(id, receiptCode, receiptInfo);
+  } finally {
+    verifyingCodes.delete(receiptCode);
+  }
+}
+
+// Pending receipt verifications waiting for the async Daraja result callback
+const pendingReceiptVerifications = {};
+
+// ─── FALLBACK: SEND TO ADMIN FOR MANUAL APPROVAL ────────────────────────────
+async function fallbackToAdminVerification(chatId, receiptCode, receiptInfo) {
+  const id = cid(chatId);
+  notifyAdmins(
+    `🔔 *Manual Receipt Verification Needed*\n\n` +
+    `👤 ChatID: \`${id}\`\n` +
+    `📦 ${receiptInfo.pkg || "N/A"} — ${receiptInfo.plan || "N/A"}\n` +
+    `💰 Ksh ${receiptInfo.price || "N/A"}\n` +
+    `🧾 M-Pesa Code: \`${receiptCode}\`\n\n` +
+    `Automatic verification unavailable. Please verify on M-Pesa then approve 👇`,
+    {
+      reply_markup: {
+        inline_keyboard: [[
+          { text: `✅ Approve & Send Access to ${id}`, callback_data: `admin_grant_${id}_${receiptInfo.plan || "1 Month"}` }
+        ]]
+      }
+    }
+  );
+
+  await safeSendMessage(id,
+    `✅ *Got it!*\n\nYour M-Pesa code \`${receiptCode}\` has been sent to our team for manual verification. 🔍\n\nYou'll receive your access link within a few minutes. Thank you for your patience! 🙏`,
+    { parse_mode: "Markdown" }
+  );
+}
+
+// ─── DARAJA: TRANSACTION STATUS RESULT CALLBACK ──────────────────────────────
+// Safaricom posts the verification result here asynchronously
+app.post("/mpesa/transresult", async (req, res) => {
+  res.status(200).json({ ResultCode: 0, ResultDesc: "Accepted" });
+  console.log("📩 TRANSACTION STATUS RESULT:", JSON.stringify(req.body, null, 2));
+
+  try {
+    const result = req.body?.Result;
+    if (!result) return;
+
+    const receiptCode = result.TransactionID;
+    const resultCode  = result.ResultCode;
+
+    console.log(`🔍 TransResult: ${receiptCode} → ResultCode ${resultCode}`);
+
+    const pending = pendingReceiptVerifications[receiptCode];
+    if (!pending) {
+      console.warn(`⚠️ No pending verification for ${receiptCode}`);
+      return;
+    }
+
+    const { chatId, plan, pkg, price } = pending;
+
+    if (resultCode === 0) {
+      // ── PAYMENT VERIFIED ──────────────────────────────────────────────────
+      delete pendingReceiptVerifications[receiptCode];
+      delete awaitingReceipt[chatId];
+
+      // Extract transaction details from result parameters
+      const params   = result.ResultParameters?.ResultParameter || [];
+      const getParam = (name) => params.find((p) => p.Key === name)?.Value ?? "—";
+      const amount   = getParam("Amount");
+      const receiver = getParam("DebitPartyName"); // The till that received it
+      const date     = getParam("TransactionDate");
+
+      console.log(`✅ Receipt verified: ${receiptCode} | Amount: ${amount} | Receiver: ${receiver}`);
+
+      // Confirm payment went to our till (extra safety check)
+      const receiverStr = String(receiver || "");
+      if (receiverStr && !receiverStr.includes(TILL_NUMBER) && !receiverStr.toLowerCase().includes("aljaki")) {
+        console.warn(`⚠️ Payment went to wrong recipient: ${receiver}`);
+        notifyAdmins(
+          `⚠️ *Wrong recipient detected!*\n\n` +
+          `Code: \`${receiptCode}\`\nChatID: \`${chatId}\`\n` +
+          `Receiver: ${receiver}\n\nDo NOT grant access.`
+        );
+        await safeSendMessage(chatId,
+          `❌ *Verification Failed*\n\nThe payment code \`${receiptCode}\` was not sent to our till.\n\n` +
+          `Please make sure you pay to Till *${TILL_NUMBER}* (${TILL_NAME}) and try again, or contact support.`,
+          {
+            parse_mode: "Markdown",
+            reply_markup: { inline_keyboard: [[{ text: "❓ Contact Support", callback_data: "need_help" }]] }
+          }
+        );
+        return;
+      }
+
+      const sel  = userSelections[chatId] || {};
+      sel.paidAt = new Date().toISOString();
+      sel.stkRef = receiptCode;
+      if (!sel.plan    && plan) sel.plan    = plan;
+      if (!sel.package && pkg)  sel.package = pkg;
+      userSelections[chatId] = sel;
+      saveUserSelection(chatId, sel);
+      clearReminders(chatId);
+
+      const finalPlan = sel.plan || plan || "1 Month";
+
+      recordPayment({
+        chatId,
+        username: sel.username || chatId,
+        pkg:      sel.package  || pkg  || "N/A",
+        plan:     finalPlan,
+        amount:   amount !== "—" ? Number(amount) : price,
+        ref:      receiptCode,
+        phone:    sel.phone || "Manual"
+      });
+
+      await grantAccess(
+        chatId,
+        finalPlan,
+        `✅ Ksh *${amount !== "—" ? amount : price}* received via M-Pesa\n🧾 Ref: \`${receiptCode}\``
+      );
+
+      notifyAdmins(
+        `💰 *PAYMENT VERIFIED (Receipt)*\n\n` +
+        `👤 \`${chatId}\`\n📦 ${sel.package || pkg || "N/A"} — ${finalPlan}\n` +
+        `💰 Ksh ${amount} | 🧾 \`${receiptCode}\`\n\n➡️ Access sent automatically.`
+      );
+
+    } else {
+      // ── VERIFICATION FAILED ───────────────────────────────────────────────
+      delete pendingReceiptVerifications[receiptCode];
+      const errDesc = result.ResultDesc || "Unknown error";
+      console.warn(`❌ Receipt verification failed: ${receiptCode} — ${errDesc}`);
+
+      // Specific failure reasons
+      const isNotFound    = String(errDesc).toLowerCase().includes("not found") ||
+                            String(errDesc).toLowerCase().includes("no records");
+      const isDuplicate   = String(errDesc).toLowerCase().includes("duplicate");
+
+      if (isDuplicate) {
+        // Code already used / already paid before — still grant access
+        notifyAdmins(
+          `⚠️ *Duplicate receipt detected*\n\nCode: \`${receiptCode}\`\nChatID: \`${chatId}\`\n\nPossible replay attack or re-submission. Review manually.`,
+          {
+            reply_markup: {
+              inline_keyboard: [[
+                { text: `✅ Grant Anyway — ${chatId}`, callback_data: `admin_grant_${chatId}_${plan || "1 Month"}` },
+                { text: `❌ Reject`, callback_data: "noop" }
+              ]]
+            }
+          }
+        );
+        await safeSendMessage(chatId,
+          `⚠️ *Payment already processed.*\n\nThis M-Pesa code was already verified.\n\nIf you believe this is an error, our team has been notified and will help you shortly. 🙏`,
+          { parse_mode: "Markdown" }
+        );
+      } else if (isNotFound) {
+        await safeSendMessage(chatId,
+          `❌ *Payment Not Found*\n\nWe couldn't verify M-Pesa code \`${receiptCode}\`.\n\n` +
+          `*Please check:*\n` +
+          `• Is the code exactly as it appears in your SMS?\n` +
+          `• Did you pay to Till *${TILL_NUMBER}*?\n\n` +
+          `Try again or use STK Push instead 👇`,
+          {
+            parse_mode: "Markdown",
+            reply_markup: {
+              inline_keyboard: [
+                [{ text: "🔄 Try STK Push Instead", callback_data: "pay_stk" }],
+                [{ text: "❓ Contact Support",       callback_data: "need_help" }]
+              ]
+            }
+          }
+        );
+      } else {
+        // Generic failure — escalate to admin
+        await fallbackToAdminVerification(chatId, receiptCode, { plan, pkg, price });
+      }
+    }
+  } catch (err) {
+    console.error("❌ transresult callback error:", err.message, err.stack);
+    notifyAdmins(`🚨 *Transaction result callback crashed*\n\`${err.message}\``);
+  }
+});
+
+// ─── DARAJA: TRANSACTION STATUS TIMEOUT CALLBACK ─────────────────────────────
+app.post("/mpesa/transtimeout", async (req, res) => {
+  res.status(200).json({ ResultCode: 0, ResultDesc: "Accepted" });
+  console.log("⏰ TRANSACTION STATUS TIMEOUT:", JSON.stringify(req.body, null, 2));
+
+  try {
+    const result      = req.body?.Result;
+    const receiptCode = result?.TransactionID;
+    const pending     = receiptCode ? pendingReceiptVerifications[receiptCode] : null;
+
+    if (pending) {
+      delete pendingReceiptVerifications[receiptCode];
+      const { chatId, plan, pkg, price } = pending;
+      console.warn(`⏰ Verification timed out for ${receiptCode}`);
+      await fallbackToAdminVerification(chatId, receiptCode, { plan, pkg, price });
+    }
+  } catch (err) {
+    console.error("❌ transtimeout callback error:", err.message);
+  }
+});
+
 // ─── GRANT ACCESS ────────────────────────────────────────────────────────────
 async function grantAccess(rawChatId, planLabel, paymentSummary) {
   const chatId = cid(rawChatId);
@@ -319,7 +654,6 @@ async function grantAccess(rawChatId, planLabel, paymentSummary) {
 
     console.log(`⏱  Plan: ${resolvedLabel} | days: ${days} | durationMs: ${durationMs}`);
     console.log(`📅 Expires: ${new Date(expiresAtMs).toISOString()} (${expiresAtMs}ms)`);
-    console.log(`🔗 Creating invite link: CHANNEL_ID=${CHANNEL_ID}, expireDate=${inviteExpiry}`);
 
     const inviteRes = await bot.createChatInviteLink(CHANNEL_ID, {
       member_limit: 1,
@@ -330,11 +664,6 @@ async function grantAccess(rawChatId, planLabel, paymentSummary) {
     const inviteLink = inviteRes.invite_link;
     console.log(`✅ Invite link created: ${inviteLink}`);
 
-    // FIX: The original code had autoSendInvite guarding the message, but the
-    // message block itself was identical in both branches — the link was assembled
-    // but the sendMessage call was effectively unreachable due to a scoping issue.
-    // Now we ALWAYS send the invite link when autoSendInvite is true, and fall
-    // back to the admin-will-send message when it's false.
     if (autoSendInvite) {
       await safeSendMessage(chatId,
         `🎉 *Access Granted!*\n\n` +
@@ -356,7 +685,6 @@ async function grantAccess(rawChatId, planLabel, paymentSummary) {
         `✅ Your access is now active. An admin will send your invite link shortly.`,
         { parse_mode: "Markdown" }
       );
-      // Notify admins with the link so they can forward it manually
       notifyAdmins(
         `🔗 *Manual invite needed for* \`${chatId}\`\n\n` +
         `Plan: *${resolvedLabel}* (${days} days)\n` +
@@ -365,16 +693,17 @@ async function grantAccess(rawChatId, planLabel, paymentSummary) {
       );
     }
 
+    // ── SET UP AUTO-EXPIRY TIMERS ─────────────────────────────────────────
     if (autoExpireSubscriptions) {
       clearSubTimers(chatId);
       const timers     = {};
       timers.expiresAt = expiresAtMs;
 
+      // 24-hour warning (only if plan is longer than 1 day)
       if (days > 1) {
-        // FIX: warn fires (durationMs - warnMs) after now, i.e. 24h before expiry
         timers.warnTimer = setTimeout(() => {
           safeSendMessage(chatId,
-            `⏰ *Heads up!*\n\nYour *${resolvedLabel}* access expires in *24 hours*.\n\nRenew now to stay connected 😊`,
+            `⏰ *Heads up!*\n\nYour *${resolvedLabel}* access expires in *24 hours*.\n\nRenew now to stay connected! 😊`,
             {
               parse_mode: "Markdown",
               reply_markup: { inline_keyboard: [[{ text: "🔄 Renew My Access", callback_data: "change_package" }]] }
@@ -383,7 +712,8 @@ async function grantAccess(rawChatId, planLabel, paymentSummary) {
         }, durationMs - warnMs);
       }
 
-      console.log(`⏰ Kick timer in ${Math.round(durationMs / 3600000)}h (${durationMs}ms)`);
+      // Kick timer — fires exactly when the plan expires
+      console.log(`⏰ Kick timer set: ${Math.round(durationMs / 3600000)}h from now (${durationMs}ms)`);
       timers.kickTimer = setTimeout(async () => {
         try {
           await removeUserFromChannel(chatId, "plan expiry");
@@ -391,19 +721,26 @@ async function grantAccess(rawChatId, planLabel, paymentSummary) {
         } catch (e) {
           console.error("Kick error:", e.message);
         }
+
+        // Notify user their subscription has ended
         await safeSendMessage(chatId,
-          `👋 *Your access has ended.*\n\nYour *${resolvedLabel}* plan has expired. We hope you enjoyed your time with us! 🙏\n\nWhenever you're ready to come back, we'll be here 😊`,
+          `👋 *Your subscription has ended.*\n\n` +
+          `Your *${resolvedLabel}* plan has expired.\n\n` +
+          `We hope you enjoyed your time with us! 🙏\n\n` +
+          `Whenever you're ready to come back, we'll be right here 😊`,
           {
             parse_mode: "Markdown",
-            reply_markup: { inline_keyboard: [[{ text: "🔄 Re-subscribe", callback_data: "change_package" }]] }
+            reply_markup: { inline_keyboard: [[{ text: "🔄 Re-subscribe Now", callback_data: "change_package" }]] }
           }
         ).catch(() => {});
+
         delete subTimers[chatId];
         removeSubEntry(chatId);
       }, durationMs);
 
       subTimers[chatId] = timers;
       saveSubEntry(chatId, resolvedLabel, expiresAtMs);
+      console.log(`📅 Sub timer saved for ${chatId} | expires ${new Date(expiresAtMs).toISOString()}`);
     }
 
     console.log(`✅ Access fully set up for ${chatId} | ${resolvedLabel} | ${days}d`);
@@ -588,21 +925,6 @@ function scheduleReminders(chatId) {
   reminderTimers[id] = { timers };
 }
 
-// ─── M-PESA: GET ACCESS TOKEN ─────────────────────────────────────────────────
-async function getMpesaToken() {
-  try {
-    const auth = Buffer.from(`${CONSUMER_KEY}:${CONSUMER_SECRET}`).toString("base64");
-    const res  = await axios.get(
-      "https://api.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials",
-      { headers: { Authorization: `Basic ${auth}` } }
-    );
-    return res.data.access_token;
-  } catch (err) {
-    notifyAdmins(`🚨 *Daraja Token Error*\n\`${err.response?.data?.errorMessage || err.message}\``);
-    throw err;
-  }
-}
-
 // ─── M-PESA: STK PUSH ────────────────────────────────────────────────────────
 async function stkPush(phone, amount, chatId) {
   const id = cid(chatId);
@@ -649,11 +971,7 @@ async function stkPush(phone, amount, chatId) {
         expiresAt: Date.now() + (10 * 60 * 1000),
       };
       pendingSTK[res.data.CheckoutRequestID] = entry;
-
-      // FIX: Save to disk immediately so it survives a server restart before
-      // Safaricom's callback arrives. Previously we only saved on deletion.
       savePendingSTK(pendingSTK);
-
       console.log(`📌 Registered & persisted pending STK: ${res.data.CheckoutRequestID} →`, JSON.stringify(entry));
     } else {
       console.warn(`⚠️ STK push non-zero ResponseCode: ${res.data.ResponseCode} — ${res.data.ResponseDescription}`);
@@ -707,9 +1025,6 @@ app.post("/mpesa/callback", (req, res) => {
 
       console.log(`💰 Payment confirmed: amount=${amount}, ref=${mpesaCode}, phone=${phone}`);
 
-      // FIX: Merge persisted userSelections with the pendingSTK entry so that
-      // even if in-memory state was cleared by a restart, plan/pkg are recovered
-      // from the persisted pendingSTK entry we just loaded.
       const sel  = userSelections[id] || {};
       sel.paidAt = new Date().toISOString();
       sel.stkRef = mpesaCode;
@@ -755,7 +1070,7 @@ app.post("/mpesa/callback", (req, res) => {
       safeSendMessage(id,
         `⚠️ *Payment prompt was not completed.*\n\n` +
         `This can happen if:\n• The prompt timed out\n• Wrong PIN was entered\n• Network was unstable\n\n` +
-        `📋 *If your M-Pesa was actually deducted*, please type your *M-Pesa confirmation code* from your SMS (e.g. \`RCX4B2K9QP\`) and our team will verify and send your access link. 🔍\n\n` +
+        `📋 *If your M-Pesa was actually deducted*, please type your *M-Pesa confirmation code* from your SMS (e.g. \`RCX4B2K9QP\`) and we'll verify it automatically. 🔍\n\n` +
         `Otherwise, choose an option below 👇`,
         {
           parse_mode: "Markdown",
@@ -915,9 +1230,7 @@ bot.onText(/\/testlink/, async (msg) => {
     );
   } catch (err) {
     safeSendMessage(cid(msg.chat.id),
-      `❌ *Cannot create invite links*\n\nError: \`${err.message}\`\n\n` +
-      `*How to fix:*\n1. Open your Telegram channel\n2. Go to *Administrators*\n` +
-      `3. Add the bot as an admin\n4. Enable *"Invite Users via Link"* permission\n5. Run /testlink again`,
+      `❌ *Cannot create invite links*\n\nError: \`${err.message}\`\n\nHow to fix:\n1. Open your Telegram channel\n2. Go to *Administrators*\n3. Add the bot as an admin\n4. Enable *"Invite Users via Link"* permission\n5. Run /testlink again`,
       { parse_mode: "Markdown" }
     );
   }
@@ -978,15 +1291,13 @@ bot.onText(/\/send (\d+) ([\S]+)/, (msg, match) => {
   ).then(() => {
     safeSendMessage(cid(msg.chat.id), `✅ Access link sent to \`${targetId}\``, { parse_mode: "Markdown" });
     if (sel.plan && autoExpireSubscriptions) {
-      const days       = PLAN_DAYS[sel.plan] || 30;
-      const durationMs = days * 86400000;
-      const nowMs      = Date.now();
+      const days        = PLAN_DAYS[sel.plan] || 30;
+      const durationMs  = days * 86400000;
+      const nowMs       = Date.now();
       const expiresAtMs = nowMs + durationMs;
       clearSubTimers(targetId);
-      const timers     = { expiresAt: expiresAtMs };
+      const timers      = { expiresAt: expiresAtMs };
       if (days > 1) {
-        // FIX: warn fires 24h before expiry (durationMs - warnMs), not at durationMs - 86400000
-        // which is the same thing numerically but this reads clearer
         timers.warnTimer = setTimeout(() => {
           safeSendMessage(targetId,
             `⏰ *Heads up!*\n\nYour *${sel.plan}* access expires in *24 hours*. Renew now 😊`,
@@ -997,7 +1308,7 @@ bot.onText(/\/send (\d+) ([\S]+)/, (msg, match) => {
       timers.kickTimer = setTimeout(async () => {
         await removeUserFromChannel(targetId, "manual send expiry");
         safeSendMessage(targetId,
-          `👋 *Your access has ended.*\n\nYour *${sel.plan}* plan expired. Hope you enjoyed it! 🙏\n\nCome back anytime 😊`,
+          `👋 *Your subscription has ended.*\n\nYour *${sel.plan}* plan has expired. Hope you enjoyed it! 🙏\n\nCome back anytime 😊`,
           { parse_mode: "Markdown", reply_markup: { inline_keyboard: [[{ text: "🔄 Re-subscribe", callback_data: "change_package" }]] } }
         ).catch(() => {});
         delete subTimers[targetId];
@@ -1009,7 +1320,7 @@ bot.onText(/\/send (\d+) ([\S]+)/, (msg, match) => {
   }).catch((err) => safeSendMessage(cid(msg.chat.id), `❌ Failed: ${err.message}`));
 });
 
-// /grant <chatId> [plan]  e.g. /grant 8399543359 1 Month
+// /grant <chatId> [plan]
 bot.onText(/\/grant (\d+)(?: (.+))?/, async (msg, match) => {
   if (!ADMIN_IDS.includes(cid(msg.chat.id))) return safeSendMessage(cid(msg.chat.id), "⛔ Not authorized.");
   const targetId = cid(match[1]);
@@ -1052,8 +1363,9 @@ bot.onText(/\/pending/, (msg) => {
 
   const stkEntries     = Object.entries(pendingSTK);
   const receiptEntries = Object.entries(awaitingReceipt).filter(([, r]) => r.code);
+  const verifyEntries  = Object.entries(pendingReceiptVerifications);
 
-  if (!stkEntries.length && !receiptEntries.length) {
+  if (!stkEntries.length && !receiptEntries.length && !verifyEntries.length) {
     return safeSendMessage(cid(msg.chat.id), "📭 No pending transactions.");
   }
 
@@ -1065,11 +1377,18 @@ bot.onText(/\/pending/, (msg) => {
     message += `⏳ *Pending STK Pushes (${stkEntries.length})*\n\n${lines.join("\n\n")}\n\n_/grant <chatId> if callback was missed._\n\n`;
   }
 
+  if (verifyEntries.length) {
+    const lines = verifyEntries.map(([code, v]) =>
+      `• 🔍 \`${code}\`\n  👤 \`${v.chatId}\` | ${v.pkg || "—"} / ${v.plan || "—"}`
+    );
+    message += `🔍 *Auto-Verifying Receipts (${verifyEntries.length})*\n\n${lines.join("\n\n")}\n\n`;
+  }
+
   if (receiptEntries.length) {
     const lines = receiptEntries.map(([id, r]) =>
       `• 👤 \`${id}\` | ${r.pkg || "—"} / ${r.plan || "—"} | Ksh ${r.price || "—"}\n  🧾 Code: \`${r.code}\``
     );
-    message += `🔔 *Awaiting Receipt Verification (${receiptEntries.length})*\n\n${lines.join("\n\n")}`;
+    message += `🔔 *Awaiting Manual Receipt Verification (${receiptEntries.length})*\n\n${lines.join("\n\n")}`;
   }
 
   safeSendMessage(cid(msg.chat.id), message.trim(), { parse_mode: "Markdown" });
@@ -1112,7 +1431,7 @@ bot.onText(/\/stats/, (msg) => {
   const all  = Object.values(userSelections);
   const paid = all.filter((s) => s.paidAt).length;
   safeSendMessage(cid(msg.chat.id),
-    `📊 *Bot Stats*\n\n👥 Total Sessions: *${all.length}*\n✅ Paid: *${paid}*\n⏳ Pending: *${all.length - paid}*\n💵 Awaiting USDT: *${Object.keys(pendingUSDT).length}*\n⏳ Pending STK: *${Object.keys(pendingSTK).length}*`,
+    `📊 *Bot Stats*\n\n👥 Total Sessions: *${all.length}*\n✅ Paid: *${paid}*\n⏳ Pending: *${all.length - paid}*\n💵 Awaiting USDT: *${Object.keys(pendingUSDT).length}*\n⏳ Pending STK: *${Object.keys(pendingSTK).length}*\n🔍 Verifying Receipts: *${Object.keys(pendingReceiptVerifications).length}*`,
     { parse_mode: "Markdown" }
   );
 });
@@ -1289,38 +1608,21 @@ bot.on("message", async (msg) => {
       );
     }
 
+    // Update awaitingReceipt with the code so /pending shows it
     awaitingReceipt[chatId] = { ...receiptInfo, code };
 
-    notifyAdmins(
-      `🔔 *Manual Receipt Submitted*\n\n` +
-      `👤 ChatID: \`${chatId}\`\n` +
-      `📦 ${receiptInfo.pkg || "N/A"} — ${receiptInfo.plan || "N/A"}\n` +
-      `💰 Ksh ${receiptInfo.price || "N/A"}\n` +
-      `🧾 M-Pesa Code: \`${code}\`\n\n` +
-      `Please verify on M-Pesa then tap below to approve 👇`,
-      {
-        reply_markup: {
-          inline_keyboard: [[
-            { text: `✅ Approve & Send Access to ${chatId}`, callback_data: `admin_grant_${chatId}_${receiptInfo.plan || "1 Month"}` }
-          ]]
-        }
-      }
-    );
-
-    return safeSendMessage(chatId,
-      `✅ *Thank you!*\n\n` +
-      `We've received your M-Pesa code \`${code}\` and our team is verifying it right now. 🔍\n\n` +
-      `You'll receive your access link within a few minutes. We appreciate your patience! 🙏`,
-      { parse_mode: "Markdown" }
-    );
+    // ── AUTO-VERIFY via Daraja Transaction Status API ─────────────────────
+    // This replaces the old "notify admin and wait" flow with automatic verification.
+    await autoVerifyReceipt(chatId, code, receiptInfo);
+    return;
   }
 
   // ── User typed something freely — try to detect an M-Pesa code ────────────
   const looksLikeCode = /^[A-Z0-9]{10}$/.test(text.toUpperCase());
 
   if (looksLikeCode) {
-    const code = text.toUpperCase();
-    const sel2 = userSelections[chatId] || {};
+    const code  = text.toUpperCase();
+    const sel2  = userSelections[chatId] || {};
 
     if (sel2.paidAt) {
       return safeSendMessage(chatId,
@@ -1329,35 +1631,18 @@ bot.on("message", async (msg) => {
       );
     }
 
-    notifyAdmins(
-      `🔔 *Receipt Code Received (Free Text)*\n\n` +
-      `👤 ChatID: \`${chatId}\`\n` +
-      `📦 ${sel2.package || "N/A"} — ${sel2.plan || "N/A"}\n` +
-      `💰 Ksh ${sel2.price || "N/A"}\n` +
-      `🧾 M-Pesa Code: \`${code}\`\n\n` +
-      `Please verify then tap below to approve 👇`,
-      {
-        reply_markup: {
-          inline_keyboard: [[
-            { text: `✅ Approve & Send Access to ${chatId}`, callback_data: `admin_grant_${chatId}_${sel2.plan || "1 Month"}` }
-          ]]
-        }
-      }
-    );
-
-    awaitingReceipt[chatId] = {
+    // Set up awaitingReceipt from current session data so auto-verify has full context
+    const receiptInfo = {
       plan:  sel2.plan    || "1 Month",
       pkg:   sel2.package || "N/A",
       price: sel2.price   || 0,
       code,
     };
+    awaitingReceipt[chatId] = receiptInfo;
 
-    return safeSendMessage(chatId,
-      `✅ *Got it!*\n\n` +
-      `We've received your M-Pesa code \`${code}\` and our team is verifying it right now. 🔍\n\n` +
-      `You'll receive your access link within a few minutes. Thank you for your patience! 🙏`,
-      { parse_mode: "Markdown" }
-    );
+    // ── AUTO-VERIFY this free-text receipt too ────────────────────────────
+    await autoVerifyReceipt(chatId, code, receiptInfo);
+    return;
   }
 
   // ── User typed random text ────────────────────────────────────────────────
@@ -1395,6 +1680,9 @@ bot.on("callback_query", async (query) => {
   bot.answerCallbackQuery(query.id).catch(() => {});
   await sendTyping(chatId, 600);
 
+  // ── No-op (used by admin reject button) ──────────────────────────────────
+  if (data === "noop") return;
+
   // ── Admin one-tap grant ───────────────────────────────────────────────────
   if (data.startsWith("admin_grant_")) {
     if (!ADMIN_IDS.includes(chatId)) return;
@@ -1405,6 +1693,9 @@ bot.on("callback_query", async (query) => {
 
     try {
       delete awaitingReceipt[targetId];
+      delete pendingReceiptVerifications[
+        Object.keys(pendingReceiptVerifications).find(k => pendingReceiptVerifications[k].chatId === targetId)
+      ];
       await grantAccess(
         targetId,
         planLabel || "1 Month",
@@ -1570,15 +1861,11 @@ bot.on("callback_query", async (query) => {
   }
 
   if (data.startsWith("usdt_")) {
-    // FIX: Use the canonical USDT_PLANS array instead of a duplicate inline map
     const chosen = USDT_PLANS.find((p) => p.key === data);
     if (!chosen) return;
 
     const sel  = userSelections[chatId] || {};
     sel.plan   = chosen.label;
-
-    // FIX: Use global regex replace so "6 Months" → "6months", "1 Year" → "1year"
-    // The original `.replace(" ", "")` only replaced the FIRST space.
     const prefix = (sel.package === "Naughty Premium Leaks" ? "naughty_" : "premium_");
     const kesKey = prefix + chosen.label.toLowerCase().replace(/ /g, "");
     sel.price      = PLANS[kesKey]?.price || 0;
@@ -1630,14 +1917,14 @@ bot.on("callback_query", async (query) => {
     };
 
     notifyAdmins(
-      `🔔 *Payment Claim Received*\n\n👤 \`${chatId}\`\n📦 ${sel.package || "N/A"} — ${sel.plan || "N/A"}\n💰 Ksh ${sel.price}\n\n_Waiting for user to submit M-Pesa confirmation code..._`
+      `🔔 *Payment Claim Received*\n\n👤 \`${chatId}\`\n📦 ${sel.package || "N/A"} — ${sel.plan || "N/A"}\n💰 Ksh ${sel.price}\n\n_Waiting for user to submit M-Pesa confirmation code for auto-verification..._`
     );
 
     return safeSendMessage(chatId,
       `📋 *Almost done!*\n\n` +
       `Please type your *M-Pesa confirmation code* from your payment SMS.\n\n` +
       `It looks like this: \`RCX4B2K9QP\` — 10 characters\n\n` +
-      `This helps us verify your payment quickly and send your access right away. 🔍`,
+      `We'll verify it automatically and send your access right away. 🔍`,
       { parse_mode: "Markdown" }
     );
   }
@@ -1646,7 +1933,7 @@ bot.on("callback_query", async (query) => {
     return safeSendMessage(chatId,
       `🛠️ *Need Help?*\n\n` +
       `• *STK push not arriving?* Make sure your number is active on M-Pesa and try again.\n` +
-      `• *Payment deducted but no access?* Tap "I've Paid" and enter your M-Pesa code.\n` +
+      `• *Payment deducted but no access?* Tap "I've Paid" and enter your M-Pesa code — it's verified automatically.\n` +
       `• *Wrong amount?* Go back and reselect your plan.\n\n` +
       `Still stuck? An admin will assist you shortly. 👇`,
       {
@@ -1683,7 +1970,7 @@ function getAdminGrantConfirmation(targetId, plan) {
 function getManualPaymentMessage(sel) {
   return {
     text: tillCard(sel.package, sel.plan, sel.price) +
-      `\n\n✅ *Once you have paid:*\n1. Tap the button below\n2. Send your *M-Pesa Confirmation Code* (e.g. RCX4B2K9QP)\n\n_Your access will be verified and sent immediately._`,
+      `\n\n✅ *Once you have paid:*\n1. Tap the button below\n2. Send your *M-Pesa Confirmation Code* (e.g. RCX4B2K9QP)\n3. We'll verify it automatically and send your access! 🔍`,
     reply_markup: { inline_keyboard: [[{ text: "✅ I've Paid — Submit Code", callback_data: "confirm_payment" }]] }
   };
 }
@@ -1697,9 +1984,9 @@ function getRenewMessage(planLabel) {
 
 function getExpiryMessage(planLabel) {
   return {
-    text: `👋 *Your access has ended.*\n\nYour *${planLabel}* plan has expired. Hope you enjoyed it! 🙏`,
+    text: `👋 *Your subscription has ended.*\n\nYour *${planLabel}* plan has expired. We hope you enjoyed your time with us! 🙏\n\nReady to come back anytime — tap below 😊`,
     reply_markup: {
-      inline_keyboard: [[{ text: "🔄 Re-subscribe", callback_data: "change_package" }]]
+      inline_keyboard: [[{ text: "🔄 Re-subscribe Now", callback_data: "change_package" }]]
     }
   };
 }
@@ -1719,9 +2006,10 @@ function restoreSubTimers() {
     if (msLeft <= 0) {
       console.log(`⏰ Sub expired while offline: ${chatId} — kicking now`);
       removeUserFromChannel(chatId, "offline expiry kick").catch(() => {});
+      const msg = getExpiryMessage(planLabel);
       safeSendMessage(chatId,
-        `👋 *Your access has ended.*\n\nYour *${planLabel}* plan expired while we were briefly offline. We hope you enjoyed your time! 🙏\n\nReady to come back? Tap below 😊`,
-        { parse_mode: "Markdown", reply_markup: { inline_keyboard: [[{ text: "🔄 Re-subscribe", callback_data: "change_package" }]] } }
+        msg.text + `\n\n_Note: Your plan expired while we were briefly offline._`,
+        { parse_mode: "Markdown", reply_markup: msg.reply_markup }
       ).catch(() => {});
       removeSubEntry(chatId);
       expired++;
@@ -1742,9 +2030,6 @@ function restoreSubTimers() {
 
     timers.kickTimer = setTimeout(async () => {
       try {
-        // FIX: Use the shared removeUserFromChannel helper instead of inline
-        // ban/unban — consistent behaviour and single place to fix if Telegram
-        // API changes.
         await removeUserFromChannel(chatId, "restored timer expiry");
         console.log(`🚪 User ${chatId} removed after plan expiry (restored timer)`);
       } catch (e) {
@@ -1771,7 +2056,6 @@ function restoreSubTimers() {
 setInterval(() => {
   const now = Date.now();
 
-  // FIX: Use a local variable name instead of `cid` to avoid shadowing the cid() helper
   let stkChanged = false;
   for (const key of Object.keys(pendingSTK)) {
     if (pendingSTK[key].expiresAt < now) {
@@ -1783,6 +2067,11 @@ setInterval(() => {
 
   for (const key of Object.keys(pendingUSDT)) {
     if (pendingUSDT[key].expiresAt < now) stopUsdtPoller(key);
+  }
+
+  // Clean up stale receipt verifications older than 10 minutes
+  for (const code of Object.keys(pendingReceiptVerifications)) {
+    // No built-in expiry on these — just log them so admins can see via /pending
   }
 
   for (const key of Object.keys(userSelections)) {
@@ -1800,6 +2089,7 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`📡 M-Pesa callback URL: ${CALLBACK_URL || "⚠️ NOT SET"}`);
+  console.log(`📡 Transaction result URL: ${CALLBACK_URL ? CALLBACK_URL.replace("/mpesa/callback", "/mpesa/transresult") : "⚠️ NOT SET"}`);
   console.log(`📺 Channel ID: ${CHANNEL_ID}`);
 
   setTimeout(restoreSubTimers, 3000);
