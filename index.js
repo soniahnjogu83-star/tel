@@ -21,7 +21,7 @@ app.get("/", (req, res) => res.status(200).send("OK"));
 const TILL_NUMBER     = process.env.TILL_NUMBER || process.env.SHORTCODE;
 const TILL_NAME       = process.env.TILL_NAME || "ALJAKI Enterprise";
 
-const ADMIN_IDS       = ["6954749470", "5355760284"];
+const ADMIN_IDS       = ["8132815796"];
 
 // For Buy Goods (Till): SHORTCODE should equal TILL_NUMBER
 // For Paybill: SHORTCODE is the paybill number
@@ -392,6 +392,7 @@ async function stkPush(phone, amount, chatId) {
 
     console.log(`📲 STK Push → phone: ${normalized}, amount: ${Math.ceil(Number(amount))}, businessShortCode: ${businessShortCode}, partyB: ${partyB}, type: ${transactionType}`);
 
+    // NOTE: TransactionDesc must be ≤13 chars, AccountReference ≤12 chars
     const payload = {
       BusinessShortCode: businessShortCode,
       Password:          password,
@@ -403,21 +404,34 @@ async function stkPush(phone, amount, chatId) {
       PhoneNumber:       normalized,
       CallBackURL:       CALLBACK_URL,
       AccountReference:  "ALJAKI",
-      TransactionDesc:   "Content Access"
+      TransactionDesc:   "Access"
     };
 
     console.log("📤 STK payload:", JSON.stringify({ ...payload, Password: "[REDACTED]" }));
 
-    const res = await axios.post(
-      "https://api.safaricom.co.ke/mpesa/stkpush/v1/processrequest",
-      payload,
-      {
-        headers: {
-          Authorization: `Bearer ${token}`,
-          "Content-Type": "application/json"
+    let res;
+    try {
+      res = await axios.post(
+        "https://api.safaricom.co.ke/mpesa/stkpush/v1/processrequest",
+        payload,
+        {
+          headers: {
+            Authorization: `Bearer ${token}`,
+            "Content-Type": "application/json"
+          }
         }
-      }
-    );
+      );
+    } catch (axiosErr) {
+      const darajaBody = axiosErr.response?.data;
+      const statusCode = axiosErr.response?.status;
+      console.error(`❌ STK HTTP ${statusCode}:`, JSON.stringify(darajaBody));
+      notifyAdmins(
+        `🚨 *STK Push HTTP ${statusCode}*\nChat: \`${id}\`\n` +
+        `Error: \`${JSON.stringify(darajaBody)}\``
+      );
+      const reason = darajaBody?.errorMessage || darajaBody?.ResultDesc || axiosErr.message;
+      throw new Error(`Daraja ${statusCode}: ${reason}`);
+    }
 
     console.log("📥 STK response:", JSON.stringify(res.data));
 
