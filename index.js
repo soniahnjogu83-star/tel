@@ -811,12 +811,11 @@ async function autoVerifyPendingTransactions() {
 setInterval(autoVerifyPendingTransactions, 30000);
 
 // ─── EXPRESS SERVER ──────────────────────────────────────────────────────────
-// ─── START BOT AND SERVER ────────────────────────────────────────────────────
+// ─── EXPRESS SERVER ──────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`📺 Channel ID: ${CHANNEL_ID}`);
+  console.log(`🤖 Bot is running with auto-approval enabled`);
+  console.log(`🧪 Test with "20 Min Test" plan for Ksh 1`);
 });
-
-// Start the bot after server is up
-startBot().catch(console.error);
