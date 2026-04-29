@@ -345,20 +345,22 @@ async function getMpesaToken() {
 //   PartyB            = SHORTCODE
 //   TransactionType   = "CustomerPayBillOnline"
 //   Password          = base64(SHORTCODE + PASSKEY + timestamp)
+// ─── M-PESA: STK PUSH ────────────────────────────────────────────────────────
 async function stkPush(phone, amount, chatId) {
   const id = cid(chatId);
   try {
     const token     = await getMpesaToken();
     const timestamp = moment().format("YYYYMMDDHHmmss");
 
-    // For till: BusinessShortCode = TILL_NUMBER, for paybill: BusinessShortCode = SHORTCODE
-    const businessShortCode = MPESA_TYPE === "paybill" ? SHORTCODE : TILL_NUMBER;
-    const partyB            = TILL_NUMBER; // always the receiving till/paybill
+    // FIX: BusinessShortCode is ALWAYS SHORTCODE (your Daraja-registered shortcode)
+    // PartyB is the receiving end: SHORTCODE for paybill, TILL_NUMBER for buy goods
+    const businessShortCode = SHORTCODE;
+    const partyB            = MPESA_TYPE === "paybill" ? SHORTCODE : TILL_NUMBER;
     const transactionType   = MPESA_TYPE === "paybill"
       ? "CustomerPayBillOnline"
       : "CustomerBuyGoodsOnline";
 
-    // Password: base64(businessShortCode + PASSKEY + timestamp)
+    // Password always uses BusinessShortCode (which is always SHORTCODE)
     const rawPassword = `${businessShortCode}${PASSKEY}${timestamp}`;
     const password    = Buffer.from(rawPassword).toString("base64");
 
