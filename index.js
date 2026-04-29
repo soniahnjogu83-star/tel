@@ -96,13 +96,13 @@ const bot = new TelegramBot(BOT_TOKEN, { polling: false });
   console.log("✅ Bot started in long-polling mode.");
 })();
 
-bot.on("polling_error", (err) => {
-  if (err.code === "ETELEGRAM" && err.message.includes("409")) {
-    console.warn("⚠️  Polling 409 — waiting for Telegram to settle...");
-  } else {
-    console.error("❌ Polling error:", err.message);
-  }
-});
+//bot.on("polling_error", (err) => {
+  //if (err.code === "ETELEGRAM" && err.message.includes("409")) {
+   // console.warn("⚠️  Polling 409 — waiting for Telegram to settle...");
+  //} else {
+    //console.error("❌ Polling error:", err.message);
+ // }
+//});
 
 // ─── LOAD PERSISTED DATA ────────────────────────────────────────────────────
 function loadPendingSTK() {
