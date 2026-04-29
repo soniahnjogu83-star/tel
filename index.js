@@ -15,8 +15,10 @@ app.use(express.json());
 app.get("/", (req, res) => res.status(200).send("OK"));
 
 // ─── CONFIG ──────────────────────────────────────────────────────────────────
-const TILL_NUMBER     = "4902476";
-const TILL_NAME       = "ALJAKI Enterprise";
+const TILL_NUMBER     = process.env.SHORTCODE;       
+3424231
+const TILL_NAME       = process.env.TILL_NAME || "ALJAKI Enterprise";
+
 const ADMIN_IDS       = ["6954749470", "5355760284"];
 const SHORTCODE       = process.env.SHORTCODE;
 const PASSKEY         = process.env.PASSKEY;
@@ -303,7 +305,7 @@ async function verifyMpesaTransaction(receiptCode) {
         SecurityCredential: password,
         CommandID:          "TransactionStatusQuery",
         TransactionID:      receiptCode,
-        PartyA:             TILL_NUMBER,
+        PartyA:             SHORTCODE,
         IdentifierType:     "4", // 4 = till number
         ResultURL:          CALLBACK_URL.replace("/mpesa/callback", "/mpesa/transresult"),
         QueueTimeOutURL:    CALLBACK_URL.replace("/mpesa/callback", "/mpesa/transresult"),
