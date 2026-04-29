@@ -28,7 +28,7 @@ const CONSUMER_SECRET = process.env.CONSUMER_SECRET;
 const CALLBACK_URL    = process.env.CALLBACK_URL || "";
 const BOT_TOKEN       = process.env.BOT_TOKEN;
 const RENDER_URL      = process.env.RENDER_EXTERNAL_URL
-  || (CALLBACK_URL ? CALLBACK_URL.replace("/mpesa/callback", "") : null);
+  || (CALLBACK_URL ? CALLBACK_URL.replace("/mpesa/callback", null) : null);
 
 // ─── PLAN CONFIG ─────────────────────────────────────────────────────────────
 const PLAN_DAYS = {
@@ -38,24 +38,33 @@ const PLAN_DAYS = {
   "1 Month":  30,
   "6 Months": 180,
   "1 Year":   365,
-  "20 Min Test": 0.0139, // 20 minutes for testing
+  "20 Min Test": 0.0139,
+  "1 Hour":   0.04167,
+  "6 Hours":  0.25,
 };
 
 const PLANS = {
-  naughty_1day:    { label: "1 Day",    price: 40 },
-  naughty_1week:   { label: "1 Week",   price: 170 },
-  naughty_2weeks:  { label: "2 Weeks",  price: 270 },
-  naughty_1month:  { label: "1 Month",  price: 450 },
-  naughty_6months: { label: "6 Months", price: 2500 },
-  naughty_1year:   { label: "1 Year",   price: 6200 },
-  naughty_test:    { label: "20 Min Test", price: 1 },
-  premium_1day:    { label: "1 Day",    price: 50 },
-  premium_1week:   { label: "1 Week",   price: 220 },
-  premium_2weeks:  { label: "2 Weeks",  price: 400 },
-  premium_1month:  { label: "1 Month",  price: 680 },
-  premium_6months: { label: "6 Months", price: 3500 },
-  premium_1year:   { label: "1 Year",   price: 7000 },
-  premium_test:    { label: "20 Min Test", price: 1 },
+  // NAUGHTY PREMIUM LEAKS (Premium Package)
+  premium_1hour:    { label: "1 Hour",    price: 20 },
+  premium_6hours:   { label: "6 Hours",   price: 30 },
+  premium_1day:     { label: "1 Day",     price: 70 },
+  premium_1week:    { label: "1 Week",    price: 220 },
+  premium_2weeks:   { label: "2 Weeks",   price: 400 },
+  premium_1month:   { label: "1 Month",   price: 680 },
+  premium_6months:  { label: "6 Months",  price: 3500 },
+  premium_1year:    { label: "1 Year",    price: 7000 },
+  premium_test:     { label: "20 Min Test", price: 1 },
+  
+  // NAUGHTY EXPLICIT (Explicit Package)
+  explicit_1hour:   { label: "1 Hour",    price: 30 },
+  explicit_6hours:  { label: "6 Hours",   price: 50 },
+  explicit_1day:    { label: "1 Day",     price: 100 },
+  explicit_1week:   { label: "1 Week",    price: 170 },
+  explicit_2weeks:  { label: "2 Weeks",   price: 270 },
+  explicit_1month:  { label: "1 Month",   price: 450 },
+  explicit_6months: { label: "6 Months",  price: 2500 },
+  explicit_1year:   { label: "1 Year",    price: 6200 },
+  explicit_test:    { label: "20 Min Test", price: 1 },
 };
 
 const USDT_PLANS = [
@@ -71,13 +80,13 @@ const warnMs         = 24 * 60 * 60 * 1000; // 24 hours
 
 const userSelections = {};
 let pendingSTK        = {};
-const awaitingReceipt = {};
+let pendingManualApprovals = {}; // Store manual approval requests
 const reminderTimers  = {};
 const subTimers       = {};
 const accessAttempts  = {}; // Track attempts to prevent duplicate errors
 
-let autoExpireSubscriptions = true; // Force true for testing
-let autoSendInvite          = true; // Force true for auto-send
+let autoExpireSubscriptions = true;
+let autoSendInvite          = true;
 
 // ─── CHANNEL_ID ──────────────────────────────────────────────────────────────
 const CHANNEL_ID = -1001567081082;
@@ -242,8 +251,8 @@ async function sendTyping(chatId, durationMs = 1500) {
   }
 }
 
-// ─── GRANT ACCESS (FIXED - No duplicate errors) ────────────────────────────────
-async function grantAccess(rawChatId, planLabel, paymentSummary) {
+// ─── GRANT ACCESS ────────────────────────────────────────────────────────────
+async function grantAccess(rawChatId, planLabel, paymentSummary, isManualApproval = false) {
   const chatId = cid(rawChatId);
   console.log(`🔍 grantAccess called: chatId=${chatId}, planLabel="${planLabel}"`);
 
@@ -302,9 +311,17 @@ async function grantAccess(rawChatId, planLabel, paymentSummary) {
     const nowMs = Date.now();
     let durationMs, expiresAtMs, inviteExpiry;
     
-    // Handle test period (20 minutes)
+    // Handle different plan durations
     if (resolvedLabel === "20 Min Test") {
-      durationMs = 20 * 60 * 1000; // 20 minutes
+      durationMs = 20 * 60 * 1000;
+      expiresAtMs = nowMs + durationMs;
+      inviteExpiry = Math.floor(expiresAtMs / 1000);
+    } else if (resolvedLabel === "1 Hour") {
+      durationMs = 60 * 60 * 1000;
+      expiresAtMs = nowMs + durationMs;
+      inviteExpiry = Math.floor(expiresAtMs / 1000);
+    } else if (resolvedLabel === "6 Hours") {
+      durationMs = 6 * 60 * 60 * 1000;
       expiresAtMs = nowMs + durationMs;
       inviteExpiry = Math.floor(expiresAtMs / 1000);
     } else {
@@ -327,7 +344,12 @@ async function grantAccess(rawChatId, planLabel, paymentSummary) {
     console.log(`✅ Invite link created: ${inviteLink}`);
 
     // Send the invite link immediately
-    const dayText = resolvedLabel === "20 Min Test" ? "20 minutes" : `${days} day(s)`;
+    let dayText = resolvedLabel;
+    if (resolvedLabel === "20 Min Test") dayText = "20 minutes";
+    else if (resolvedLabel === "1 Hour") dayText = "1 hour";
+    else if (resolvedLabel === "6 Hours") dayText = "6 hours";
+    else dayText = `${days} day(s)`;
+    
     await safeSendMessage(chatId,
       `🎉 *Access Granted!*\n\n` +
       `${paymentSummary}\n\n` +
@@ -365,9 +387,9 @@ async function grantAccess(rawChatId, planLabel, paymentSummary) {
         removeSubEntry(chatId);
       }, durationMs);
       
-      // Send warning for longer plans (not needed for 20 min test)
+      // Send warning for longer plans (not needed for short plans)
       let warnTimer = null;
-      if (resolvedLabel !== "20 Min Test" && days > 1 && durationMs > warnMs) {
+      if (resolvedLabel !== "20 Min Test" && resolvedLabel !== "1 Hour" && resolvedLabel !== "6 Hours" && days > 1 && durationMs > warnMs) {
         warnTimer = setTimeout(() => {
           safeSendMessage(chatId,
             `⏰ *Heads up, ${username}!*\n\nYour *${resolvedLabel}* access expires in *24 hours*.\n\nRenew now to stay connected 😊`,
@@ -385,6 +407,11 @@ async function grantAccess(rawChatId, planLabel, paymentSummary) {
 
     console.log(`✅ Access fully set up for ${chatId} | ${resolvedLabel}`);
     delete accessAttempts[chatId];
+
+    // Clean up manual approval if this was from one
+    if (isManualApproval) {
+      delete pendingManualApprovals[chatId];
+    }
 
   } catch (err) {
     console.error("❌ grantAccess error:", err.message);
@@ -464,9 +491,13 @@ async function restoreActiveSubscriptions() {
       
       // Set up warning timer if needed
       let warnTimer = null;
-      const days = PLAN_DAYS[resolvedLabel];
-      const durationMs = (resolvedLabel === "20 Min Test") ? 20 * 60 * 1000 : days * 24 * 60 * 60 * 1000;
-      if (resolvedLabel !== "20 Min Test" && days > 1 && remainingMs > warnMs) {
+      let durationMs;
+      if (resolvedLabel === "20 Min Test") durationMs = 20 * 60 * 1000;
+      else if (resolvedLabel === "1 Hour") durationMs = 60 * 60 * 1000;
+      else if (resolvedLabel === "6 Hours") durationMs = 6 * 60 * 60 * 1000;
+      else durationMs = PLAN_DAYS[resolvedLabel] * 24 * 60 * 60 * 1000;
+      
+      if (resolvedLabel !== "20 Min Test" && resolvedLabel !== "1 Hour" && resolvedLabel !== "6 Hours" && PLAN_DAYS[resolvedLabel] > 1 && remainingMs > warnMs) {
         warnTimer = setTimeout(() => {
           safeSendMessage(chatId,
             `⏰ *Heads up, ${username}!*\n\nYour *${resolvedLabel}* access expires in *24 hours*.\n\nRenew now to stay connected 😊`,
@@ -602,7 +633,7 @@ app.post("/mpesa/callback", (req, res) => {
   }
 });
 
-// ─── /start (FIXED - Completely resets user state) ──────────────────────────────
+// ─── /start ──────────────────────────────────────────────────────────────────
 bot.onText(/\/start/, async (msg) => {
   const chatId = cid(msg.chat.id);
   const username = msg.from.username ? `@${msg.from.username}` : msg.from.first_name;
@@ -620,8 +651,8 @@ bot.onText(/\/start/, async (msg) => {
     {
       reply_markup: {
         inline_keyboard: [
-          [{ text: "🔥 Naughty Premium Leaks", callback_data: "package_naughty_premium_leaks" }],
-          [{ text: "💥 Naughty Explicit", callback_data: "package_naughty_explicit" }],
+          [{ text: "🔥 Premium (Naughty Premium Leaks)", callback_data: "package_premium" }],
+          [{ text: "💥 Explicit (Naughty Explicit)", callback_data: "package_explicit" }],
           [{ text: "🧪 TEST: 20 Min Access (1 KSH)", callback_data: "package_test" }]
         ]
       }
@@ -646,6 +677,54 @@ bot.onText(/\/testlink/, async (msg) => {
   }
 });
 
+// ─── ADMIN APPROVAL COMMANDS ─────────────────────────────────────────────────
+bot.onText(/\/approve (\d+)/, async (msg, match) => {
+  if (!ADMIN_IDS.includes(cid(msg.chat.id))) return;
+  
+  const targetId = cid(match[1]);
+  const pending = pendingManualApprovals[targetId];
+  
+  if (!pending) {
+    return safeSendMessage(cid(msg.chat.id), `❌ No pending approval found for user ${targetId}`);
+  }
+  
+  try {
+    await grantAccess(targetId, pending.plan, `✅ Manual payment approved by admin\n💰 Amount: Ksh ${pending.price}\n🧾 Code: \`${pending.code}\``, true);
+    await safeSendMessage(cid(msg.chat.id), `✅ Access granted to ${targetId} for ${pending.plan}`);
+    
+    // Notify user
+    await safeSendMessage(targetId,
+      `✅ *Payment Approved!*\n\n` +
+      `Your payment of Ksh *${pending.price}* has been verified.\n\n` +
+      `Your access link has been sent above. Enjoy! 🎉`
+    );
+  } catch (err) {
+    await safeSendMessage(cid(msg.chat.id), `❌ Failed to grant access: ${err.message}`);
+  }
+});
+
+bot.onText(/\/deny (\d+)/, async (msg, match) => {
+  if (!ADMIN_IDS.includes(cid(msg.chat.id))) return;
+  
+  const targetId = cid(match[1]);
+  const pending = pendingManualApprovals[targetId];
+  
+  if (!pending) {
+    return safeSendMessage(cid(msg.chat.id), `❌ No pending approval found for user ${targetId}`);
+  }
+  
+  delete pendingManualApprovals[targetId];
+  
+  // Notify user
+  await safeSendMessage(targetId,
+    `❌ *Payment Denied*\n\n` +
+    `We could not verify your payment with code \`${pending.code}\`.\n\n` +
+    `Please check your transaction and try again, or use STK Push for instant access.`
+  );
+  
+  await safeSendMessage(cid(msg.chat.id), `✅ Payment denied for ${targetId}`);
+});
+
 // ─── Package handlers ─────────────────────────────────────────────────────────
 bot.on("callback_query", async (query) => {
   const chatId = cid(query.message.chat.id);
@@ -667,51 +746,62 @@ bot.on("callback_query", async (query) => {
         reply_markup: {
           inline_keyboard: [
             [{ text: "📲 Pay via STK Push", callback_data: "pay_stk" }],
-            [{ text: "💳 Manual via Till", callback_data: "show_till" }]
+            [{ text: "💳 Enter Transaction Code", callback_data: "manual_code" }],
+            [{ text: "🏧 Manual via Till", callback_data: "show_till" }]
           ]
         }
       }
     );
   }
   
-  if (data === "package_naughty_premium_leaks") {
+  if (data === "package_premium") {
     userSelections[chatId] = { 
       ...userSelections[chatId],
-      package: "Naughty Premium Leaks" 
+      package: "Premium (Naughty Premium Leaks)" 
     };
     saveUserSelection(chatId, userSelections[chatId]);
-    return safeSendMessage(chatId, `🔥 *Naughty Premium Leaks*\n\nSelect plan:`, {
+    return safeSendMessage(chatId, `🔥 *Premium Package*\n\nSelect plan:`, {
       reply_markup: {
         inline_keyboard: [
-          [{ text: "1 Day — Ksh 40", callback_data: "naughty_1day" }],
-          [{ text: "1 Week — Ksh 170", callback_data: "naughty_1week" }],
-          [{ text: "1 Month — Ksh 450", callback_data: "naughty_1month" }],
-          [{ text: "🧪 TEST: 20 Min (1 KSH)", callback_data: "naughty_test" }]
-        ]
-      }
-    });
-  }
-  
-  if (data === "package_naughty_explicit") {
-    userSelections[chatId] = { 
-      ...userSelections[chatId],
-      package: "Naughty Explicit" 
-    };
-    saveUserSelection(chatId, userSelections[chatId]);
-    return safeSendMessage(chatId, `💥 *Naughty Explicit*\n\nSelect plan:`, {
-      reply_markup: {
-        inline_keyboard: [
-          [{ text: "1 Day — Ksh 50", callback_data: "premium_1day" }],
+          [{ text: "1 Hour — Ksh 20", callback_data: "premium_1hour" }],
+          [{ text: "6 Hours — Ksh 30", callback_data: "premium_6hours" }],
+          [{ text: "1 Day — Ksh 70", callback_data: "premium_1day" }],
           [{ text: "1 Week — Ksh 220", callback_data: "premium_1week" }],
+          [{ text: "2 Weeks — Ksh 400", callback_data: "premium_2weeks" }],
           [{ text: "1 Month — Ksh 680", callback_data: "premium_1month" }],
+          [{ text: "6 Months — Ksh 3500", callback_data: "premium_6months" }],
+          [{ text: "1 Year — Ksh 7000", callback_data: "premium_1year" }],
           [{ text: "🧪 TEST: 20 Min (1 KSH)", callback_data: "premium_test" }]
         ]
       }
     });
   }
   
-  // Plan selection
-  if (PLANS[data]) {
+  if (data === "package_explicit") {
+    userSelections[chatId] = { 
+      ...userSelections[chatId],
+      package: "Explicit (Naughty Explicit)" 
+    };
+    saveUserSelection(chatId, userSelections[chatId]);
+    return safeSendMessage(chatId, `💥 *Explicit Package*\n\nSelect plan:`, {
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: "1 Hour — Ksh 30", callback_data: "explicit_1hour" }],
+          [{ text: "6 Hours — Ksh 50", callback_data: "explicit_6hours" }],
+          [{ text: "1 Day — Ksh 100", callback_data: "explicit_1day" }],
+          [{ text: "1 Week — Ksh 170", callback_data: "explicit_1week" }],
+          [{ text: "2 Weeks — Ksh 270", callback_data: "explicit_2weeks" }],
+          [{ text: "1 Month — Ksh 450", callback_data: "explicit_1month" }],
+          [{ text: "6 Months — Ksh 2500", callback_data: "explicit_6months" }],
+          [{ text: "1 Year — Ksh 6200", callback_data: "explicit_1year" }],
+          [{ text: "🧪 TEST: 20 Min (1 KSH)", callback_data: "explicit_test" }]
+        ]
+      }
+    });
+  }
+  
+  // Premium plan selection
+  if (data.startsWith("premium_") && PLANS[data]) {
     const plan = PLANS[data];
     const sel = userSelections[chatId] || {};
     sel.plan = plan.label;
@@ -720,12 +810,36 @@ bot.on("callback_query", async (query) => {
     saveUserSelection(chatId, sel);
     
     return safeSendMessage(chatId,
-      `✅ *${sel.package || "Package"}* — *${plan.label}*\n💰 Ksh *${plan.price}*\n\nHow would you like to pay?`,
+      `✅ *${sel.package || "Premium"}* — *${plan.label}*\n💰 Ksh *${plan.price}*\n\nHow would you like to pay?`,
       {
         reply_markup: {
           inline_keyboard: [
             [{ text: "📲 Pay via STK Push", callback_data: "pay_stk" }],
-            [{ text: "💳 Manual via Till", callback_data: "show_till" }]
+            [{ text: "💳 Enter Transaction Code", callback_data: "manual_code" }],
+            [{ text: "🏧 Manual via Till", callback_data: "show_till" }]
+          ]
+        }
+      }
+    );
+  }
+  
+  // Explicit plan selection
+  if (data.startsWith("explicit_") && PLANS[data]) {
+    const plan = PLANS[data];
+    const sel = userSelections[chatId] || {};
+    sel.plan = plan.label;
+    sel.price = plan.price;
+    userSelections[chatId] = sel;
+    saveUserSelection(chatId, sel);
+    
+    return safeSendMessage(chatId,
+      `✅ *${sel.package || "Explicit"}* — *${plan.label}*\n💰 Ksh *${plan.price}*\n\nHow would you like to pay?`,
+      {
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: "📲 Pay via STK Push", callback_data: "pay_stk" }],
+            [{ text: "💳 Enter Transaction Code", callback_data: "manual_code" }],
+            [{ text: "🏧 Manual via Till", callback_data: "show_till" }]
           ]
         }
       }
@@ -742,13 +856,36 @@ bot.on("callback_query", async (query) => {
     return safeSendMessage(chatId, `📱 *Enter your M-Pesa phone number* (e.g., 0712345678):`);
   }
   
+  if (data === "manual_code") {
+    const sel = userSelections[chatId];
+    if (!sel || !sel.price) {
+      return safeSendMessage(chatId, `⚠️ Please select a package first using /start`);
+    }
+    userSelections[chatId].awaitingManualCode = true;
+    saveUserSelection(chatId, userSelections[chatId]);
+    return safeSendMessage(chatId,
+      `📝 *Enter your M-Pesa Transaction Code*\n\n` +
+      `Please send the 10-character code from your M-Pesa message (e.g., \`RCX4B2K9QP\`)\n\n` +
+      `*Note:* This will be reviewed by an admin and you'll receive access within a few minutes.`
+    );
+  }
+  
   if (data === "show_till") {
     const sel = userSelections[chatId];
     if (!sel || !sel.price) {
       return safeSendMessage(chatId, `⚠️ Please select a package first using /start`);
     }
     return safeSendMessage(chatId,
-      `💳 *M-Pesa Till Number:* \`${TILL_NUMBER}\`\n📛 *Business:* ${TILL_NAME}\n💰 *Amount:* Ksh ${sel.price}\n\nSend the exact amount and text \`/confirm YOUR_CODE\` after payment.`
+      `🏧 *M-Pesa Till Number:* \`${TILL_NUMBER}\`\n📛 *Business:* ${TILL_NAME}\n💰 *Amount:* Ksh ${sel.price}\n\n` +
+      `After payment, tap the "Enter Transaction Code" button below to submit your code for verification.`,
+      {
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: "💳 Enter Transaction Code", callback_data: "manual_code" }],
+            [{ text: "🔄 Back to Payment Options", callback_data: `back_to_payment_${sel.plan}` }]
+          ]
+        }
+      }
     );
   }
   
@@ -761,16 +898,36 @@ bot.on("callback_query", async (query) => {
     return safeSendMessage(chatId, `🔄 Choose your package:`, {
       reply_markup: {
         inline_keyboard: [
-          [{ text: "🔥 Naughty Premium Leaks", callback_data: "package_naughty_premium_leaks" }],
-          [{ text: "💥 Naughty Explicit", callback_data: "package_naughty_explicit" }],
+          [{ text: "🔥 Premium (Naughty Premium Leaks)", callback_data: "package_premium" }],
+          [{ text: "💥 Explicit (Naughty Explicit)", callback_data: "package_explicit" }],
           [{ text: "🧪 TEST: 20 Min Access (1 KSH)", callback_data: "package_test" }]
         ]
       }
     });
   }
+  
+  if (data.startsWith("back_to_payment_")) {
+    const planLabel = data.replace("back_to_payment_", "");
+    const sel = userSelections[chatId];
+    if (sel && sel.plan) {
+      return safeSendMessage(chatId,
+        `✅ *${sel.package || "Package"}* — *${sel.plan}*\n💰 Ksh *${sel.price}*\n\nHow would you like to pay?`,
+        {
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: "📲 Pay via STK Push", callback_data: "pay_stk" }],
+              [{ text: "💳 Enter Transaction Code", callback_data: "manual_code" }],
+              [{ text: "🏧 Manual via Till", callback_data: "show_till" }]
+            ]
+          }
+        }
+      );
+    }
+    return safeSendMessage(chatId, `Please select a package using /start`);
+  }
 });
 
-// ─── Handle text messages (Phone numbers & Auto-approval) ──────────────────────
+// ─── Handle text messages (Phone numbers & Manual codes) ──────────────────────
 bot.on("message", async (msg) => {
   if (!msg.text || msg.text.startsWith("/")) return;
   
@@ -778,7 +935,7 @@ bot.on("message", async (msg) => {
   const text = msg.text.trim();
   const sel = userSelections[chatId];
   
-  // Handle phone number input
+  // Handle phone number input for STK Push
   if (sel && sel.awaitingPhone) {
     sel.awaitingPhone = false;
     saveUserSelection(chatId, sel);
@@ -791,10 +948,10 @@ bot.on("message", async (msg) => {
       if (result.ResponseCode === "0") {
         await safeSendMessage(chatId,
           `✅ *Payment prompt sent!*\n\nEnter your M-Pesa PIN to complete.\n\n` +
-          `If you've already paid, send your 10-character M-Pesa code (e.g., \`RCX4B2K9QP\`) to get access immediately.`
+          `Once payment is confirmed, you'll automatically receive access.`
         );
       } else {
-        await safeSendMessage(chatId, `⚠️ Could not send prompt. Try manual payment.`);
+        await safeSendMessage(chatId, `⚠️ Could not send prompt. Try manual payment instead.`);
       }
     } catch (err) {
       await safeSendMessage(chatId, `❌ Invalid number. Please use /start to try again.`);
@@ -802,45 +959,82 @@ bot.on("message", async (msg) => {
     return;
   }
   
-  // AUTO-APPROVAL: If user sends a 10-character code
-  if (/^[A-Z0-9]{10}$/i.test(text)) {
+  // Handle manual transaction code submission (requires admin approval)
+  if (sel && sel.awaitingManualCode && /^[A-Z0-9]{10}$/i.test(text)) {
+    sel.awaitingManualCode = false;
     const code = text.toUpperCase();
     
-    if (sel && sel.paidAt) {
-      // Check if subscription is still active
-      const subData = loadSubs()[chatId];
-      if (subData && subData.expiresAt > Date.now()) {
-        return safeSendMessage(chatId, `✅ You already have an active subscription! Enjoy the content 😊`);
-      } else {
-        // Clear old paid status to allow new purchase
-        delete sel.paidAt;
-        saveUserSelection(chatId, sel);
-      }
+    // Check if user has an active subscription
+    const subData = loadSubs()[chatId];
+    if (subData && subData.expiresAt > Date.now()) {
+      return safeSendMessage(chatId, `✅ You already have an active subscription! Enjoy the content 😊`);
     }
     
     if (!sel || !sel.price) {
       return safeSendMessage(chatId, `⚠️ Please select a package first using /start`);
     }
     
-    // Auto-approve immediately
-    sel.paidAt = new Date().toISOString();
-    sel.stkRef = code;
-    sel.autoApproved = true;
-    userSelections[chatId] = sel;
-    saveUserSelection(chatId, sel);
+    // Store pending approval
+    pendingManualApprovals[chatId] = {
+      plan: sel.plan,
+      price: sel.price,
+      code: code,
+      package: sel.package,
+      username: sel.username,
+      timestamp: Date.now()
+    };
     
-    await grantAccess(chatId, sel.plan || "1 Month", `✅ Code \`${code}\` verified\n💰 Amount: Ksh ${sel.price}`);
+    // Notify user
+    await safeSendMessage(chatId,
+      `⏳ *Transaction Code Received*\n\n` +
+      `Code: \`${code}\`\n` +
+      `Amount: Ksh ${sel.price}\n` +
+      `Plan: ${sel.plan}\n\n` +
+      `Your payment is pending admin verification. You'll receive access once approved.\n\n` +
+      `*This usually takes 2-5 minutes.*`
+    );
+    
+    // Notify admins
+    notifyAdmins(
+      `🕐 *MANUAL PAYMENT AWAITING APPROVAL*\n\n` +
+      `👤 User: \`${chatId}\` (${sel.username || "Unknown"})\n` +
+      `📦 Package: ${sel.package || "N/A"}\n` +
+      `📅 Plan: ${sel.plan}\n` +
+      `💰 Amount: Ksh ${sel.price}\n` +
+      `🧾 Code: \`${code}\`\n\n` +
+      `Use:\n` +
+      `/approve ${chatId} - to grant access\n` +
+      `/deny ${chatId} - to deny access`,
+      { reply_markup: {
+        inline_keyboard: [
+          [{ text: "✅ Approve", callback_data: `admin_approve_${chatId}` }, 
+           { text: "❌ Deny", callback_data: `admin_deny_${chatId}` }]
+        ]
+      }}
+    );
+    
+    saveUserSelection(chatId, sel);
     return;
+  }
+  
+  // If user sends a code but not in manual mode, prompt them to use the button
+  if (/^[A-Z0-9]{10}$/i.test(text) && (!sel || !sel.awaitingManualCode)) {
+    return safeSendMessage(chatId,
+      `📝 Please select a package first using /start, then tap the "Enter Transaction Code" button to submit your payment code.`
+    );
   }
   
   // Check if user has an active subscription before asking for payment
   const subData = loadSubs()[chatId];
   if (subData && subData.expiresAt > Date.now()) {
     // User has active subscription, don't ask for payment
+    const remainingHours = Math.ceil((subData.expiresAt - Date.now()) / (1000 * 60 * 60));
     const remainingDays = Math.ceil((subData.expiresAt - Date.now()) / (1000 * 60 * 60 * 24));
+    let timeText = remainingDays > 0 ? `${remainingDays} day(s)` : `${remainingHours} hour(s)`;
+    
     await safeSendMessage(chatId,
       `✨ *You're already subscribed!* ✨\n\n` +
-      `Your *${subData.planLabel}* plan is active with *${remainingDays} day(s)* remaining.\n\n` +
+      `Your *${subData.planLabel}* plan is active with *${timeText}* remaining.\n\n` +
       `Enjoy the sweet content! 😊\n\n` +
       `Want to extend or upgrade? Tap below 👇`,
       {
@@ -854,15 +1048,83 @@ bot.on("message", async (msg) => {
   if (!sel || !sel.price) {
     await safeSendMessage(chatId,
       `🎬 *Ready for some sweet content?*\n\n` +
-      `Send your *10-character M-Pesa code* (e.g., \`RCX4B2K9QP\`) to get access immediately.\n\n` +
-      `Or tap /start to select a package.`
+      `Tap /start to select a package and payment method.`
     );
-  } else if (!sel.paidAt) {
+  } else if (!sel.paidAt && !sel.awaitingManualCode) {
     await safeSendMessage(chatId,
       `💫 *Almost there!*\n\n` +
-      `Send your *10-character M-Pesa code* (e.g., \`RCX4B2K9QP\`) to complete your purchase.\n\n` +
-      `Or tap /start to choose a different package.`
+      `Tap one of the payment options below to complete your purchase.`,
+      {
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: "📲 Pay via STK Push", callback_data: "pay_stk" }],
+            [{ text: "💳 Enter Transaction Code", callback_data: "manual_code" }],
+            [{ text: "🏧 Manual via Till", callback_data: "show_till" }]
+          ]
+        }
+      }
     );
+  }
+});
+
+// ─── Admin callback handlers for quick approval ──────────────────────────────
+bot.on("callback_query", async (query) => {
+  const data = query.data;
+  const adminId = cid(query.from.id);
+  
+  if (data && data.startsWith("admin_approve_")) {
+    if (!ADMIN_IDS.includes(adminId)) {
+      return bot.answerCallbackQuery(query.id, { text: "Only admins can approve payments" });
+    }
+    
+    const targetId = data.replace("admin_approve_", "");
+    const pending = pendingManualApprovals[targetId];
+    
+    if (!pending) {
+      await bot.answerCallbackQuery(query.id, { text: "No pending approval found" });
+      return;
+    }
+    
+    await bot.answerCallbackQuery(query.id, { text: "Processing approval..." });
+    
+    try {
+      await grantAccess(targetId, pending.plan, `✅ Manual payment approved by admin\n💰 Amount: Ksh ${pending.price}\n🧾 Code: \`${pending.code}\``, true);
+      await safeSendMessage(adminId, `✅ Access granted to ${targetId} for ${pending.plan}`);
+      await safeSendMessage(targetId,
+        `✅ *Payment Approved!*\n\n` +
+        `Your payment of Ksh *${pending.price}* has been verified.\n\n` +
+        `Your access link has been sent above. Enjoy! 🎉`
+      );
+    } catch (err) {
+      await safeSendMessage(adminId, `❌ Failed to grant access: ${err.message}`);
+    }
+    return;
+  }
+  
+  if (data && data.startsWith("admin_deny_")) {
+    if (!ADMIN_IDS.includes(adminId)) {
+      return bot.answerCallbackQuery(query.id, { text: "Only admins can deny payments" });
+    }
+    
+    const targetId = data.replace("admin_deny_", "");
+    const pending = pendingManualApprovals[targetId];
+    
+    if (!pending) {
+      await bot.answerCallbackQuery(query.id, { text: "No pending approval found" });
+      return;
+    }
+    
+    delete pendingManualApprovals[targetId];
+    await bot.answerCallbackQuery(query.id, { text: "Payment denied" });
+    
+    await safeSendMessage(targetId,
+      `❌ *Payment Denied*\n\n` +
+      `We could not verify your payment with code \`${pending.code}\`.\n\n` +
+      `Please check your transaction and try again, or use STK Push for instant access.`
+    );
+    
+    await safeSendMessage(adminId, `✅ Payment denied for ${targetId}`);
+    return;
   }
 });
 
@@ -887,6 +1149,7 @@ app.get("/api/status", (req, res) => {
     status: "online",
     autoApprove: true,
     pendingSTKCount: Object.keys(pendingSTK).length,
+    pendingManualCount: Object.keys(pendingManualApprovals).length,
     activeSubscriptions: Object.keys(subTimers).length,
     persistedSubscriptions: Object.keys(subs).length,
     activeSessions: Object.keys(userSelections).length,
@@ -938,6 +1201,7 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`📺 Channel ID: ${CHANNEL_ID}`);
-  console.log(`🤖 Bot is running with auto-approval enabled`);
+  console.log(`🤖 Bot is running with auto-approval for STK Push`);
+  console.log(`👨‍💼 Manual transaction codes require admin approval`);
   console.log(`🧪 Test with "20 Min Test" plan for Ksh 1`);
 });
